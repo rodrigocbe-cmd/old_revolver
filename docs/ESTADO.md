@@ -3,9 +3,16 @@
 _Última atualização: 2026-10-13_
 
 ## Marco atual
-Marcos 1–3 alcançados na 1ª passada (ELF identificado; mapa do Ghidra com 12.580 funções + 62.414
-rótulos; C++ gerado: 74.947 funções recompiladas, 47 stubs, 0 falhas de decodificação).
-Refazendo 2–3 com o ELF de seções separadas. Próximo: marco 4 (compilar o runner).
+Marcos 1–3 alcançados com o ELF de seções separadas (sessão de 2026-10-13):
+- Ghidra (reanalisado): 12.580 funções + 62.062 rótulos exportados → `config/funcmap.csv`.
+- `ps2_runtime.lib` compilada sem erros (`out/build`, RelWithDebInfo; `logs/build_runtime_lib.log`).
+- 2026-10-14: `entry_004fb340` (dados da libipu no `.text`) marcado como `skip` (FUNCOES.md #1).
+  `ps2_recomp` (log `logs/recompile_20261014_184432.log`): 74.642 funções processadas,
+  74.594 recompiladas, 47 stubs, 1 skip, **0 instruções não tratadas**, 0 falhas de decodificação.
+  `out/generated` limpo (74.645 arquivos = funções + 3).
+
+Marco 4 (compilar o runner) interrompido em 88% por falta de RAM no notebook; continuará no
+desktop (ver Bloqueios e "Migração para outra máquina").
 
 ## Disco
 | Item | Valor |
@@ -103,14 +110,53 @@ Observações do código no commit fixado:
 | Script | Faz |
 |---|---|
 | `scripts/env.ps1` | carrega vcvars64 (MSVC), CMake, Ninja, JAVA_HOME |
-| `scripts/1_setup.ps1` | clona/fixa PS2Recomp, aplica patch, compila ferramentas em `out/tools` |
+| `scripts/0_game.ps1 [-Iso caminho]` | confere o SHA-1 da ISO em `ROM/`, extrai o ELF e o disco para `game/`, gera o ELF descomprimido |
+| `scripts/1_setup.ps1` | inicializa o submódulo `external/PS2Recomp` no commit fixado, aplica patch, compila ferramentas em `out/tools` |
 | `scripts/2_recompile.ps1 [-Export]` | exporta mapa do Ghidra → `config/funcmap.csv` + `config/ghidra_export.toml`; mescla com `config/project.toml` → `out/recomp.toml`; gera C++ em `out/generated` |
-| `scripts/3_build.ps1` | copia o C++ para o runner e compila `ps2EntryRunner` em `out/build` |
+| `scripts/3_build.ps1 [-NoSync] [-Jobs N] [-Config X]` | copia o C++ para o runner e compila `ps2EntryRunner` em `out/build`; impede suspensão durante o build. `-NoSync` retoma sem recopiar; `-Jobs` limita o paralelismo |
 | `scripts/4_run.ps1 [-Seconds N]` | roda por N s com `game/disc` como cdrom0, log em `logs/` |
 
 ## Bloqueios
-- Nenhum no momento.
+- **RAM insuficiente no notebook (8 GB) para o build do runner.** Em 2026-10-14 o build chegou a
+  2075/2344 (88%, sem erros de compilação), mas os últimos blocos unity são pesados: com 16 `cl.exe`
+  em paralelo o sistema entra em swap pesado e o Windows caiu duas vezes com bugcheck
+  **0x9F DRIVER_POWER_STATE_FAILURE** (19:29 e 20:02), mesmo com suspensão bloqueada.
+  Decisão: continuar no **desktop** (mais RAM). No notebook, só com `3_build.ps1 -NoSync -Jobs 2`
+  (lento; o link final de ~75 mil funções com símbolos também pode exigir vários GB).
+
+## Migração para outra máquina
+Vai pelo git: scripts, tools, config (inclui `funcmap.csv` e `ghidra_export.toml`, então o Ghidra
+**não** é necessário para compilar), docs, e o submódulo `external/PS2Recomp` (`.gitmodules`).
+Levar à mão: a ISO (→ `ROM/`). Opcional: `out/ghidra/` (projeto Ghidra analisado, 58 MB).
+
+Pré-requisitos: Git, Python ≥ 3.11 (usa `tomllib`), Visual Studio com a carga "Desenvolvimento
+para desktop com C++" (traz MSVC e CMake), Ninja (`winget install Ninja-build.Ninja`).
+
+```powershell
+git clone --recurse-submodules https://github.com/rodrigocbe-cmd/old_revolver.git
+cd old_revolver
+# copiar a ISO para ROM\
+.\scripts\0_game.ps1        # confere SHA-1, extrai ELF + disco, descomprime o ELF
+.\scripts\1_setup.ps1       # PS2Recomp no commit fixado + ferramentas
+.\scripts\2_recompile.ps1   # C++ em out\generated (sem -Export: usa o CSV do git)
+.\scripts\3_build.ps1       # ps2EntryRunner.exe
+.\scripts\4_run.ps1 -Seconds 30
+```
+Se o PowerShell bloquear os scripts: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+Conferir que o ELF descomprimido saiu com SHA-256 `ba2252cc…1745a` (ver acima).
 
 ## Próximos passos
-1. Concluir a autoanálise do Ghidra e exportar (`2_recompile.ps1 -Export`).
-4. Conferir no PCSX2 (breakpoint em 0x00100008) se a RAM em 0x00100000 bate com a imagem descomprimida.
+1. No desktop: seguir "Migração" e `3_build.ps1` → `ps2EntryRunner.exe` (marco 4). Erros vão para
+   TOML/runtime/patch, nunca no C++ gerado.
+2. `scripts/4_run.ps1 -Seconds 30` e analisar o log (function not found, syscalls TODO, IOP/IRX).
+3. Conferir no PCSX2 (breakpoint em 0x00100008) se a RAM em 0x00100000 bate com a imagem descomprimida.
+
+Espaço: o disco extraído (2,2 GB) + C++ gerado + build com símbolos ocupam vários GB; deixar ≥ 20 GB livres.
+
+## Notas de ambiente
+- Scripts `.ps1` só em ASCII (PowerShell 5.1 lê sem BOM como ANSI).
+- Logs dos scripts saem em UTF-8 (`Out-File -Encoding utf8`); o `*>` do PS 5.1 grava UTF-16.
+- O aviso "'vswhere.exe' não é reconhecido" ao carregar o `vcvars64.bat` é inofensivo.
+- Ghidra headless precisa de `JAVA_HOME` (o `env.ps1` define). Projeto: `out/ghidra/RDR.gpr`.
+- Ferramentas auxiliares temporárias (venv com capstone para desmontar) ficaram fora do projeto,
+  no scratchpad da sessão; recriar se necessário (`pip install capstone`).

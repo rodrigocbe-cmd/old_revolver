@@ -1,0 +1,5 @@
+[submodule "external/PS2Recomp"]
+	path = external/PS2Recomp
+	url = https://github.com/ran-j/PS2Recomp
+	# 3_build.ps1 copia o C++ gerado para ps2xRuntime/src/runner; nao marcar como sujo por isso
+	ignore = dirty

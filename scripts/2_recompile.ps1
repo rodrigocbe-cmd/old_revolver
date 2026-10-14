@@ -30,6 +30,8 @@ if ($Export -or -not (Test-Path $csv)) {
     Select-String -Path $log -Pattern 'Exported' | ForEach-Object { $_.Line.Trim() }
 }
 
+# ps2_recomp nao remove arquivos de execucoes anteriores
+if (Test-Path $outDir) { cmd /c rmdir /s /q "`"$outDir`"" }
 New-Item -ItemType Directory -Force $outDir | Out-Null
 python -I (Join-Path $RDR_ROOT 'tools\make_recomp_config.py') $exportToml (Join-Path $RDR_ROOT 'config\project.toml') $elf $csv $outDir $recompToml
 if ($LASTEXITCODE) { throw 'falha ao gerar out/recomp.toml' }

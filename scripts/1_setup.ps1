@@ -10,8 +10,11 @@ $PS2RECOMP_COMMIT = '2c5fbb9389e11dd95693385969490c9e8e6f57b4'   # 2026-10-05
 $src = Join-Path $RDR_ROOT 'external\PS2Recomp'
 $patch = Join-Path $RDR_ROOT 'patches\ps2recomp-runtime.patch'
 
-if (-not (Test-Path $src)) {
-    git clone $PS2RECOMP_URL $src
+# Submodulo (ver .gitmodules). Num clone novo a pasta existe vazia: inicializa antes de usar
+# git -C, senao o comando cairia no repositorio principal.
+if (-not (Test-Path (Join-Path $src '.git'))) {
+    git -C $RDR_ROOT submodule update --init external/PS2Recomp
+    if (-not (Test-Path (Join-Path $src '.git'))) { git clone $PS2RECOMP_URL $src }
 }
 git -C $src fetch --quiet origin
 git -C $src checkout --quiet $PS2RECOMP_COMMIT

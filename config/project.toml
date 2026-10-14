@@ -16,7 +16,9 @@ patch_cache = true
 # Adicionados aos stubs/entry_points do Ghidra
 stubs = []
 entry_points = []
-skip = []
+skip = [
+  "entry_004fb340@0x004FB340",  # dados da libipu dentro do .text (FUNCOES.md #1)
+]
 
 [patches]
 instructions = []

@@ -69,8 +69,8 @@ skip = []
 
 [ghidra_export]
 function_count = 12580
-code_label_count = 62414
-csv_record_count = 74994
+code_label_count = 62062
+csv_record_count = 74642
 stub_count = 47
 untracked_stub_count = 0
 skip_count = 0

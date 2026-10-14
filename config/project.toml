@@ -1,0 +1,22 @@
+# Configuracao do projeto, mesclada sobre o TOML exportado pelo Ghidra
+# (config/ghidra_export.toml) por tools/make_recomp_config.py -> out/recomp.toml.
+#
+# Regra: toda entrada em stubs/skip/patches precisa estar registrada em docs/FUNCOES.md
+# (endereco, nome/hipotese, motivo, se e temporaria, como foi verificada).
+# Enderecos referem-se a game/SLUS_205.00.unpacked.elf (ver docs/ESTADO.md).
+
+[general]
+single_file_output = false
+low_memory_mode = false
+output_worker_threads = 0
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+
+# Adicionados aos stubs/entry_points do Ghidra
+stubs = []
+entry_points = []
+skip = []
+
+[patches]
+instructions = []

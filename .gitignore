@@ -1,0 +1,13 @@
+ROM/
+game/
+out/
+generated/
+logs/
+*.iso
+*.elf
+*.bin
+SLUS_*
+SLES_*
+SLPM_*
+*.irx
+*.IRX

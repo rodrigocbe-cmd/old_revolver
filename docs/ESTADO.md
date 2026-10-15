@@ -1,8 +1,50 @@
 # Estado do projeto
 
-_Última atualização: 2026-10-14 (desktop)_
+_Última atualização: 2026-10-15 (desktop, sessão noturna)_
 
 ## Marco atual
+
+**Resumo 2026-10-15 (19h45): MENU PRINCIPAL ALCANÇADO.** Fluxo: ... Demo Mode → Start → vídeo do
+Red no deserto (título) → Start → **menu de livros** ("Player in Progress", "X Enter / O Options").
+Correções: FUNCOES.md #30 (BindRpc IOP→EE 0xADDA fingido), #31 (ioman do IOP: open/read/lseek/close →
+AGESND abre `BANKS.DAT`), #32 (ENDX do SPU2 = todas as vozes terminadas; sem isso o jogo esperava 18
+vozes e caía num `b .` em 0x102B18), #33 (4 rodadas no `find_code_gaps.py`: 0x4BF098, 0x2BB100,
+0x2B7FE0, 0x234500), #34 (rastreio `PS2X_RPC_TRACE`). Runtime: `PS2X_WINDOW_SIZE=WxH` abre a janela
+maior (só escala a imagem). Preview: `out/preview/Jogar.bat`.
+**Problemas visíveis:** fundo do menu com ruído colorido (textura da mesa errada?); ~10–12 fps; sem áudio.
+**Próximo:** textura do fundo do menu; entrar num jogo (New Game); desempenho; áudio.
+Roteiro de teste guiado pela tela: `scratchpad/drive.ps1` + `classify.py` (fora do repositório).
+
+**Resumo 2026-10-15 (15h):** **marcos 8, 9 e 11 (parcial) alcançados.** Fluxo completo até agora:
+logo Rockstar (FMV) → abertura / vídeo de demonstração → **Start** → checagem de memory card → tela
+legal (motor) → tela de carregamento (tambor) → diálogo "save danificado, Retry?" (cartão emulado
+vazio; responder **No** com S/seta para baixo segurado ~0,5 s e X) → aviso de Autosave (X) → LOADING →
+**Demo Mode em 3D em tempo real** (personagens, armas, cenários). ~10–12 fps, sem áudio. Correções
+desta etapa: FUNCOES.md #26 (COP0 Count), #27 (lacunas sem jr), #28 (GetInfo do memory card).
+Teclado: Enter = Start, Espaço/X = X, C/Esc = Círculo, Z = Quadrado, V = Triângulo, WASD/setas =
+direcional (enviar setas sintéticas exige a flag de tecla estendida). Próximo: Start no Demo Mode →
+menu principal; desempenho (VU1/GS interpretados); áudio; conferir #25 no PCSX2.
+
+**Resumo 2026-10-15 (13h):** marcos 8 e 9 (parcial) alcançados. Fluxo atual: logo da Rockstar
+(FMV) → abertura cinematográfica / vídeo de demonstração em loop → **Start** (teclado Enter, libpad
+via HLE) encerra o vídeo → checagem de memory card → **tela legal desenhada pelo motor do jogo**
+(VU1 → XGKICK → GS). Correções desta etapa: FUNCOES.md #16 (listras do FMV, VIF1 DIRECT/IMAGE),
+#17 (rastreador de funções desligado: jogo mais rápido), #18 (libpad), #19 (parada do vídeo),
+#20 (DECI2 como console de varejo), #21 (+173 funções em regiões órfãs), #22 (mcserv), #23 (VIF1
+contínuo entre pedaços do MFIFO), #24 (instrumentação), #25 (JR da VU1). Próximo: ver o que vem após
+a tela legal (título/menu), conferir #25 no PCSX2, áudio.
+
+**Resumo 2026-10-15 (manhã):** marcos 5–8 alcançados. O boot inicializa EE/IOP, carrega os 10 IRX,
+lê o disco (ISO via override), monta a lista de desenho no MFIFO e **toca o vídeo de abertura da
+Rockstar Games do começo ao fim** (FFmpeg via HLE de MPEG; sem som). Depois do vídeo o jogo
+encontrou a 1ª função fora do mapa do Ghidra (`0x2CAE18`, chamada por ponteiro); 602 inícios de
+função em lacunas do mapa foram adicionados (FUNCOES.md #15) e o rebuild está em andamento.
+Intervenções #2–#15 em FUNCOES.md; mudanças do runtime em `patches/ps2recomp-runtime.patch`
+(MFIFO, interrupção do GS, ReadChain, relógio do BlockTrans, opções de MPEG). Ferramentas novas:
+`tools/ghidra/DumpRegion.java`, `tools/ghidra/DecompileFuncs.java`, `tools/sync_generated.py`,
+`tools/find_code_gaps.py`. Diagnóstico: `[run:thread]`/`[run:sema]` a cada 600 ticks no log;
+pilhas via `cdb` (WinDbg); capturas de tela via script (F1 esconde o painel de debug).
+
 Marcos 1–3 alcançados com o ELF de seções separadas (sessão de 2026-10-13):
 - Ghidra (reanalisado): 12.580 funções + 62.062 rótulos exportados → `config/funcmap.csv`.
 - `ps2_runtime.lib` compilada sem erros (`out/build`, RelWithDebInfo; `logs/build_runtime_lib.log`).
@@ -30,7 +72,24 @@ carregou e iniciou os 10 IRX do jogo (`SIO2MAN`, `MTAPMAN`, `PADMAN`, `LIBSD`, `
 version 4.0.1", `MODSEIN`, `MODMIDI`, `MODHSYN`, `AGESND`); `GsSetCrt(interlaced=1, NTSC)`; frames
 enviados à janela (ainda pretos); 2 threads ativas.
 
-**Bloqueio atual:** a `GameThread` fica em `pc=0x3c7400 ra=0x3c7434`, dentro de `FUN_003c7338` (bind
+**Lote 2 + override de CD (`logs/run_20261015_003107.log`):** passou do bind do cdvdfsv; o override
+aponta a ISO (`[rdr] CD image: ...ROM\Red Dead Revolver (USA) (SLUS-20500).iso`); 3 threads. Parou em
+`pc=0x46fb68` (`FUN_0046fa60`, chamado pelo laço de quadro `FUN_00236058`): espera
+`SPR_FROM.MADR == VIF1.TADR` — o jogo usa o **MFIFO** do DMAC (FUNCOES.md #6), que o runtime não
+emulava. Implementado no patch do runtime (`logs/run_20261015_014016.log`: `[MFIFO] drain ... tadr=fill`,
+laço de 0x46FB68 resolvido).
+
+**Depois do MFIFO:** o jogo chegou ao **primeiro vídeo** (FMV dos logos): parou em `0x497F90/98`
+(`FUN_00497f48`, busca de start code MPEG via IPU, chamado pelo parser de cabeçalho `FUN_00498030`).
+O runtime não emula a IPU; a libmpeg do jogo foi ligada ao HLE de MPEG/FFmpeg (lote 3, FUNCOES.md #7).
+
+**Lote 3 (`logs/run_20261015_024819.log`):** o FFmpeg decodifica o primeiro vídeo (sequence header
+`000001b3`, quadros 512x448) e `sceMpegGetPicture` entrega quadros ao jogo; o display muda
+(`dispfb1=0x11000`); os quadros passam pelo MFIFO até o GS. Parou após 10 quadros: o player
+sincroniza pela posição do áudio (`sceSdBlockTransStatus` via `sceSdRemote`), que não avançava pela
+RPC do IOP → lote 4 (FUNCOES.md #8). Rebuild em andamento.
+
+**Bloqueio anterior (resolvido no lote 2):** a `GameThread` ficava em `pc=0x3c7400 ra=0x3c7434`, dentro de `FUN_003c7338` (bind
 dos comandos N da libcdvd): `while(1){ while(sceSifBindRpc(0x4fcc50, 0x80000595) < 0); if (cd->server
 @0x4fcc74) break; espera; }`. O SID 0x80000595 (cdvdfsv) não é servido pelo IOP emulado (cdvdfsv vem
 da ROM do IOP/IOPRP), então `server` fica 0 para sempre. Solução: ligar as funções de alto nível da

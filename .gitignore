@@ -3,6 +3,7 @@ game/
 out/
 generated/
 logs/
+CLAUDE.md
 *.iso
 *.elf
 *.bin

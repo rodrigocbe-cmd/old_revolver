@@ -2,6 +2,7 @@
 
 Usage: python tools/make_recomp_config.py <ghidra_export.toml> <project.toml> <elf> <funcmap.csv> <out_dir> <dest.toml>
 """
+import os
 import sys
 import tomllib
 
@@ -52,6 +53,13 @@ def main():
     general['entry_points'] = merged_list(
         eg.get('untracked_stubs', []) + eg.get('entry_points', []), pg.get('entry_points', []))
     general['skip'] = merged_list(eg.get('skip', []), pg.get('skip', []))
+
+    # Inicios de funcao fora do mapa do Ghidra, gerados por tools/find_code_gaps.py
+    gaps_path = os.path.join(os.path.dirname(project_path), 'code_gaps.toml')
+    if os.path.exists(gaps_path):
+        with open(gaps_path, 'rb') as f:
+            gaps = tomllib.load(f).get('general', {}).get('entry_points', [])
+        general['entry_points'] = merged_list(general['entry_points'], gaps)
 
     lines = ['# Gerado por tools/make_recomp_config.py -- nao editar; edite config/project.toml', '',
              '[general]']

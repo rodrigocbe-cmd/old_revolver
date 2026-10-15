@@ -43,6 +43,45 @@ stubs = [
   "sceIoctl@0x003CF5E8",
   "sceCdInit@0x003C77C0",
   "sceCdMmode@0x003C8038",
+  # Lote 2 (FUNCOES.md #3): resto da libcdvd usada pelo jogo (cdvdfsv nao existe no IOP emulado)
+  "sceCdNcmdDiskReady@0x003C74A8",
+  "sceCdSync@0x003C7540",
+  "sceCdSyncS@0x003C75E0",
+  "sceCdReadChain@0x003C7AA8",
+  "sceCdRead@0x003C7DC0",
+  "sceCdGetError@0x003C7FA0",
+  # Lote 3 (FUNCOES.md #7): libmpeg do player de FMV -> HLE com FFmpeg (o runtime nao emula a IPU)
+  "sceMpegInit@0x00493140",
+  "sceMpegCreate@0x004931F0",
+  "sceMpegAddCallback@0x00493530",
+  "sceMpegAddStrCallback@0x004928D8",
+  "sceMpegDemuxPss@0x004928B8",
+  "sceMpegGetPicture@0x00493410",
+  "sceMpegIsEnd@0x00493468",
+  "sceMpegReset@0x00493478",
+  "sceMpegDelete@0x00493400",
+  # Lote 4 (FUNCOES.md #8): libsdr usada so pelo player de FMV (posicao do BlockTrans nao avancava)
+  "sceSdRemoteInit@0x0049AFE8",
+  "sceSdRemote@0x0049B128",
+  # FUNCOES.md #9: callback M2V do player de FMV (o HLE de MPEG decodifica sozinho; o anel de video do
+  # jogo nao tem consumidor e travava a thread leitora dentro do sceMpegDemuxPss)
+  "ret1@0x00471158",
+  # Lote 5 (FUNCOES.md #18): libpad -> HLE (teclado/gamepad do host; o jogo nao recebia entrada)
+  "scePadInit@0x003C8640",
+  "scePadPortOpen@0x003C88A0",
+  "scePadPortClose@0x003C8A88",
+  "scePadEnd@0x003C8820",
+  "scePadRead@0x003C8BA0",
+  "scePadGetState@0x003C8D08",
+  "scePadGetReqState@0x003C8DF0",
+  "scePadInfoMode@0x003C8F70",
+  "scePadSetMainMode@0x003C90A8",
+  "scePadInfoAct@0x003C8E48",
+  "scePadSetActAlign@0x003C9220",
+  "scePadSetActDirect@0x003C9160",
+  "scePadInfoPressMode@0x003C9460",
+  "scePadEnterPressMode@0x003C94C0",
+  "scePadExitPressMode@0x003C9518",
 ]
 entry_points = []
 skip = [

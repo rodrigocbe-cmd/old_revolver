@@ -31,4 +31,6 @@ $jdk = Get-ChildItem 'C:\Program Files\Eclipse Adoptium' -Directory -ErrorAction
 if ($jdk) { $env:JAVA_HOME = $jdk.FullName }
 
 $Global:RDR_ROOT = Split-Path -Parent $PSScriptRoot
+# logs/ e ignorado pelo git; num clone novo ainda nao existe
+New-Item -ItemType Directory -Force (Join-Path $Global:RDR_ROOT 'logs') | Out-Null
 $Global:GHIDRA_HOME = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Directory -Filter 'ghidra_*_PUBLIC' | Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName

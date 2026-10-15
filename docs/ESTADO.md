@@ -1,6 +1,6 @@
 # Estado do projeto
 
-_Última atualização: 2026-10-13_
+_Última atualização: 2026-10-14 (desktop)_
 
 ## Marco atual
 Marcos 1–3 alcançados com o ELF de seções separadas (sessão de 2026-10-13):
@@ -11,8 +11,45 @@ Marcos 1–3 alcançados com o ELF de seções separadas (sessão de 2026-10-13)
   74.594 recompiladas, 47 stubs, 1 skip, **0 instruções não tratadas**, 0 falhas de decodificação.
   `out/generated` limpo (74.645 arquivos = funções + 3).
 
-Marco 4 (compilar o runner) interrompido em 88% por falta de RAM no notebook; continuará no
-desktop (ver Bloqueios e "Migração para outra máquina").
+**Marco 4 alcançado (2026-10-14, desktop 32 GB / 16 threads):** `out/build/ps2xRuntime/ps2EntryRunner.exe`
+(354 MB, RelWithDebInfo) com `3_build.ps1 -Jobs 12`: 2452 passos, 0 erros, ~47 min, RAM livre mínima
+~11 GB (log `logs/build_20261014_205734.log`). Pipeline 0→3 refeito do zero no desktop: SHA-1 da ISO e
+SHA-256 do ELF descomprimido conferem; `ps2_recomp` gerou os mesmos 74.645 arquivos.
+
+**Primeiro boot (`logs/run_20261014_214439.log`):** raylib/OpenGL e áudio sobem, ELF carregado, execução
+em 0x100008, `SetupHeap` ok. Depois da inicialização do SIF o processo **não termina nem avança** por
+30 s; últimas linhas (stderr):
+```
+[sceSifGetReg] reg=0x80000002 value=0x0 pc=0x3cd4d8 ra=0x3cd4d8
+[sceSifSetDma:CALL] pc=0x3cd114 ra=0x3cd114 list=0x1f7fbe0 count=1
+[sceSifSetDma:DESC] i=0 src=0x7673c0 dst=0x0 size=0x10 attr=0x44 pc=0x3cd114 ra=0x3cd114
+```
+**Lote 1 de stubs (FUNCOES.md #2, 2026-10-14, `logs/run_20261014_232108.log`):** o boot passou do
+`sceSifInitRpc`. `SifInitRpc` HLE inicializado; reboot/sync do IOP ok; o IOP emulado (`ps2xIOP`)
+carregou e iniciou os 10 IRX do jogo (`SIO2MAN`, `MTAPMAN`, `PADMAN`, `LIBSD`, `SDHD`, `SDRDRV` "SDR driver
+version 4.0.1", `MODSEIN`, `MODMIDI`, `MODHSYN`, `AGESND`); `GsSetCrt(interlaced=1, NTSC)`; frames
+enviados à janela (ainda pretos); 2 threads ativas.
+
+**Bloqueio atual:** a `GameThread` fica em `pc=0x3c7400 ra=0x3c7434`, dentro de `FUN_003c7338` (bind
+dos comandos N da libcdvd): `while(1){ while(sceSifBindRpc(0x4fcc50, 0x80000595) < 0); if (cd->server
+@0x4fcc74) break; espera; }`. O SID 0x80000595 (cdvdfsv) não é servido pelo IOP emulado (cdvdfsv vem
+da ROM do IOP/IOPRP), então `server` fica 0 para sempre. Solução: ligar as funções de alto nível da
+libcdvd (`sceCdRead`, `sceCdSync`, `sceCdSearchFile`, `sceCdDiskReady`, `sceCdGetError`, `sceCdSt*`…)
+ao HLE do runtime (lote 2).
+
+**Causa do 1º travamento (confirmada com cdb, pilha da `GameThread` com 20 s de execução, CPU ~1,25 núcleo):**
+laço ativo em `entry_003cd508` (parte de `FUN_003cd3b0`):
+```c
+while (FUN_003ccc58(0) == 0) ;   // FUN_003ccc58(i) = *(u32*)(0x767300 + i*4)
+sceSifSetReg(0x80000002, 1);
+```
+Padrão do `sceSifInitRpc` do SDK: espera o IOP gravar o SREG 0 e marca RPCINIT. `FUN_003ccc58` é o
+`sceSifGetSreg` da libkernl (o nome é **hipótese** pelo padrão; lê o vetor de SREGs em 0x767300 na
+RAM do guest). O `ps2xRuntime` emula os SREGs num mapa próprio (`g_sifSregs` em `SIF.cpp`) e tem
+HLE para `sceSifInitCmd/InitRpc/BindRpc/CallRpc/GetSreg/...`, mas só os wrappers de syscall (47 stubs
+do Ghidra, `SetGsCrt`…`Deci2Call`, 0x3CAE20–0x3CB650) estão ligados. As funções de biblioteca do
+SIF/RPC (e, por extensão, libcdvd, libpad, libmc) são recompiladas do jogo e esperam um IOP real do
+outro lado, que nunca responde.
 
 ## Disco
 | Item | Valor |
@@ -85,12 +122,17 @@ Módulos IOP em `SYSTEM/`: `IOPRP280.IMG` (269.889), `AGESND.IRX` (58.200), `LIB
 |---|---|
 | Visual Studio Community 2026 | carga C++ (MSVC + CMake) |
 | Ninja | 1.13.2 (winget) |
+| Desktop (2026-10-14) | VS Community 2026 + carga C++ (MSVC 14.51, CMake 4.3.1), Ninja 1.13.2, Python 3.14, Git 2.56; RTX 3060; JDK Temurin 21.0.12.1, Ghidra 12.1.4 (SHA-256 conferido) + extensão EE v2.1.38 (SHA-256 `e389ff3e…f240b`); WinDbg 1.2610 (`cdb.exe`, para pilhas do runner) |
 | JDK | Eclipse Temurin 21.0.12.1 — `C:\Program Files\Eclipse Adoptium\jdk-21.0.12.101-hotspot` |
 | Ghidra | 12.1.4 (`ghidra_12.1.4_PUBLIC_20260921.zip`, SHA-256 `ddac49f9…d2d4db` conferido) — `%LOCALAPPDATA%\Programs\ghidra_12.1.4_PUBLIC` |
 | Extensão EE | ghidra-emotionengine-reloaded v2.1.38 (build 12.1.4) — `%APPDATA%\ghidra\ghidra_12.1.4_PUBLIC\Extensions` |
 | PCSX2 | instalado pelo usuário |
 
-Projeto Ghidra: `out/ghidra/RDR.gpr` (ELF descomprimido importado como `r5900:LE:32:default`, ainda sem autoanálise).
+Projeto Ghidra: `out/ghidra/RDR.gpr`. No desktop o dono do projeto foi trocado de `RodrigoBechara` para
+`rodri` em `RDR.rep/project.prp` (original em `project.prp.notebook`); ao levar de volta, restaurar.
+Scripts headless do projeto em `tools/ghidra/` (`DumpRegion.java`, `DecompileFuncs.java`); o
+`analyzeHeadless` precisa só de `JAVA_HOME` (não carregar o `env.ps1` com `2>`/`2>$null`, que quebra no aviso do vswhere).
+Histórico: (ELF descomprimido importado como `r5900:LE:32:default`, ainda sem autoanálise).
 
 ## PS2Recomp
 | Item | Valor |
@@ -113,11 +155,13 @@ Observações do código no commit fixado:
 | `scripts/0_game.ps1 [-Iso caminho]` | confere o SHA-1 da ISO em `ROM/`, extrai o ELF e o disco para `game/`, gera o ELF descomprimido |
 | `scripts/1_setup.ps1` | inicializa o submódulo `external/PS2Recomp` no commit fixado, aplica patch, compila ferramentas em `out/tools` |
 | `scripts/2_recompile.ps1 [-Export]` | exporta mapa do Ghidra → `config/funcmap.csv` + `config/ghidra_export.toml`; mescla com `config/project.toml` → `out/recomp.toml`; gera C++ em `out/generated` |
-| `scripts/3_build.ps1 [-NoSync] [-Jobs N] [-Config X]` | copia o C++ para o runner e compila `ps2EntryRunner` em `out/build`; impede suspensão durante o build. `-NoSync` retoma sem recopiar; `-Jobs` limita o paralelismo |
-| `scripts/4_run.ps1 [-Seconds N]` | roda por N s com `game/disc` como cdrom0, log em `logs/` |
+| `scripts/3_build.ps1 [-NoSync] [-Jobs N] [-Config X]` | sincroniza (só o que mudou, `tools/sync_generated.py`) o C++ para o runner e compila `ps2EntryRunner` em `out/build`; impede suspensão durante o build. `-NoSync` retoma sem recopiar; `-Jobs` limita o paralelismo |
+| `scripts/4_run.ps1 [-Seconds N]` | roda por N s com `game/disc` como cdrom0, log em `logs/` (stdout + stderr anexado) |
 
 ## Bloqueios
-- **RAM insuficiente no notebook (8 GB) para o build do runner.** Em 2026-10-14 o build chegou a
+- **Boot travado em `sceSifInitRpc`** (ver "Marco atual"): funções de biblioteca do SIF/RPC do jogo
+  não estão ligadas ao HLE do runtime.
+- (Resolvido no desktop) **RAM insuficiente no notebook (8 GB) para o build do runner.** Em 2026-10-14 o build chegou a
   2075/2344 (88%, sem erros de compilação), mas os últimos blocos unity são pesados: com 16 `cl.exe`
   em paralelo o sistema entra em swap pesado e o Windows caiu duas vezes com bugcheck
   **0x9F DRIVER_POWER_STATE_FAILURE** (19:29 e 20:02), mesmo com suspensão bloqueada.
@@ -146,9 +190,12 @@ Se o PowerShell bloquear os scripts: `Set-ExecutionPolicy -Scope CurrentUser Rem
 Conferir que o ELF descomprimido saiu com SHA-256 `ba2252cc…1745a` (ver acima).
 
 ## Próximos passos
-1. No desktop: seguir "Migração" e `3_build.ps1` → `ps2EntryRunner.exe` (marco 4). Erros vão para
-   TOML/runtime/patch, nunca no C++ gerado.
-2. `scripts/4_run.ps1 -Seconds 30` e analisar o log (function not found, syscalls TODO, IOP/IRX).
+1. Lote 2: identificar o resto da libcdvd (região ~0x3C6000–0x3C8040; comandos N via `FUN_003c7338`,
+   comandos S via `FUN_003c7650`; chamadores do jogo `FUN_0025cac0`, `FUN_00407318`) e ligar ao HLE
+   (`sceCdRead`, `sceCdSync`, `sceCdSearchFile`, `sceCdSt*`, …). Depois libpad/libmtap/libmc e o
+   servidor RPC do lado EE (`FUN_004bd550`). Ver lista em FUNCOES.md.
+2. Rebuild: com `tools/sync_generated.py` só o que mudou é copiado; mudança de stubs altera
+   `ps2_recompiled_stubs.h` (incluído por todos) e ainda força build completo (~50 min).
 3. Conferir no PCSX2 (breakpoint em 0x00100008) se a RAM em 0x00100000 bate com a imagem descomprimida.
 
 Espaço: o disco extraído (2,2 GB) + C++ gerado + build com símbolos ocupam vários GB; deixar ≥ 20 GB livres.

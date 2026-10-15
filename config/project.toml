@@ -14,7 +14,36 @@ patch_cop0 = true
 patch_cache = true
 
 # Adicionados aos stubs/entry_points do Ghidra
-stubs = []
+stubs = [
+  # Lote 1 (FUNCOES.md #2): libkernl SIF/RPC, boot do IOP, loadfile, IOP heap, fileio e
+  # init da libcdvd ligados ao HLE do ps2xRuntime (o codigo do jogo esperava um IOP real).
+  "sceSifInitCmd@0x003CCC80",
+  "sceSifExitCmd@0x003CCF00",
+  "sceSifAddCmdHandler@0x003CCF38",
+  "sceSifRemoveCmdHandler@0x003CCFB0",
+  "sceSifGetSreg@0x003CCC58",
+  "sceSifInitRpc@0x003CD3B0",
+  "sceSifExitRpc@0x003CD550",
+  "sceSifBindRpc@0x003CD9F0",
+  "sceSifCallRpc@0x003CDBC0",
+  "sceSifCheckStatRpc@0x003CDDB8",
+  "sceSifRebootIop@0x003D0398",
+  "sceSifSyncIop@0x003D0348",
+  "sceSifLoadFileReset@0x003CFEA0",
+  "sceSifLoadModule@0x003D01B0",
+  "sceSifInitIopHeap@0x003CFB70",
+  "sceSifAllocIopHeap@0x003CFBF8",
+  "sceSifFreeIopHeap@0x003CFC68",
+  "sceFsReset@0x003CEA50",
+  "sceOpen@0x003CEA88",
+  "sceClose@0x003CED10",
+  "sceLseek@0x003CEE90",
+  "sceRead@0x003CF0C8",
+  "sceWrite@0x003CF328",
+  "sceIoctl@0x003CF5E8",
+  "sceCdInit@0x003C77C0",
+  "sceCdMmode@0x003C8038",
+]
 entry_points = []
 skip = [
   "entry_004fb340@0x004FB340",  # dados da libipu dentro do .text (FUNCOES.md #1)

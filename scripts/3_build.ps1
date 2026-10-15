@@ -17,12 +17,10 @@ $build = Join-Path $RDR_ROOT 'out\build'
 if (-not (Test-Path (Join-Path $gen 'register_functions.cpp'))) { throw 'out/generated vazio: rode 2_recompile.ps1' }
 
 if (-not $NoSync) {
-    # Sincroniza o codigo gerado + overrides do projeto
-    Get-ChildItem $runner -Filter *.cpp | Remove-Item
-    Copy-Item (Join-Path $gen '*.cpp') $runner
-    Copy-Item (Join-Path $gen '*.h') $include
-    Get-ChildItem (Join-Path $RDR_ROOT 'src') -Filter *.cpp -ErrorAction SilentlyContinue | Copy-Item -Destination $runner
-    "{0} arquivos .cpp em runner" -f (Get-ChildItem $runner -Filter *.cpp).Count
+    # Sincroniza o codigo gerado + overrides do projeto, copiando so o que mudou de conteudo
+    # (preserva a data dos arquivos identicos para o Ninja nao recompilar tudo)
+    python -I (Join-Path $RDR_ROOT 'tools\sync_generated.py') $gen $runner $include (Join-Path $RDR_ROOT 'src')
+    if ($LASTEXITCODE) { throw 'falha ao sincronizar out/generated com o runner' }
 
     cmake -S $src -B $build -G Ninja "-DCMAKE_BUILD_TYPE=$Config" `
         -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF

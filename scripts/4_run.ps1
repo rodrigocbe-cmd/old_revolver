@@ -21,10 +21,11 @@ $exe = Get-ChildItem (Join-Path $root 'out\build') -Recurse -Filter ps2EntryRunn
 if (-not $exe) { throw 'ps2EntryRunner.exe nao encontrado: rode 3_build.ps1' }
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+New-Item -ItemType Directory -Force (Join-Path $root 'logs') | Out-Null
 $log = Join-Path $root "logs\run_$stamp.log"
 $p = Start-Process -FilePath $exe.FullName -ArgumentList "`"$elf`"" -WorkingDirectory $disc `
     -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru
-if (-not $p.WaitForExit($Seconds * 1000)) { Stop-Process -Id $p.Id -Force; "encerrado apos $Seconds s" }
+if (-not $p.WaitForExit($Seconds * 1000)) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(); "encerrado apos $Seconds s" }
 else { "saiu com codigo $($p.ExitCode)" }
 Get-Content "$log.err" | Add-Content $log
 Remove-Item "$log.err"

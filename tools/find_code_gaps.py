@@ -174,6 +174,7 @@ def main():
     # Tabelas de salto de switch (vizinhos apontando para perto) ficam de fora; so entram alvos
     # logo apos `jr $ra` + delay slot, ou prologos `addiu sp,sp,-N` precedidos de nop.
     known = set(s for s, _ in ranges) | set(starts)
+    fun_starts = set(s for s, _, n in named if n.startswith('FUN_'))
     pointer_starts = []
     count = struct.unpack_from('<H', data, 0x2C)[0]
     for k in range(count):
@@ -192,12 +193,18 @@ def main():
             if not is_text(x) or x in known or any(s <= x < e for s, e in DATA_IN_TEXT):
                 continue
             neighbours = [dword(b) for b in (a - 4, a + 4) if dvaddr <= b < dvaddr + dfilesz - 3]
-            if any(is_text(y) and abs(y - x) < 0x400 for y in neighbours):
+            # vizinho que ja e inicio de funcao (FUN_ do Ghidra) indica vtable, nao tabela de salto
+            # (ex.: 0x4D6620 na vtable 0x5133F4, entre FUN_004d63d0 e FUN_004da0c8)
+            if any(is_text(y) and abs(y - x) < 0x400 and y not in fun_starts for y in neighbours):
                 continue  # provavel tabela de salto
             w0 = word(x)
             after_ret = word(x - 8) == JR_RA and w0 != 0
             prologue = (w0 >> 16) == 0x27BD and (w0 & 0x8000) != 0 and word(x - 4) == 0
-            if (after_ret or prologue) and x not in pointer_starts:
+            # funcao folha sem prologo apos um nop, terminando num `jr $ra` proximo (ex.: 0x4C2DE8,
+            # volume de capsula chamado pela vtable 0x506B4C, depois de pares "lw v0,N(a1); nop")
+            leaf = (word(x - 4) == 0 and w0 != 0 and not is_control(w0)
+                    and any(word(x + 4 * j) == JR_RA for j in range(1, 64)))
+            if (after_ret or prologue or leaf) and x not in pointer_starts:
                 pointer_starts.append(x)
     starts = sorted(set(starts) | set(pointer_starts))
 

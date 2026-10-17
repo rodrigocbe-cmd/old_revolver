@@ -4,6 +4,67 @@ _Última atualização: 2026-10-15 (desktop, sessão noturna)_
 
 ## Marco atual
 
+**Progresso (2026-10-17 10h): GAMEPLAY — Red anda na fase 1.** A queda pelo terreno era do recompilador
+(#52): `LQ/SQ/LQC2/SQC2` não alinhavam o endereço (`& ~0xF`), e o teste de triângulo da malha do cenário
+(`FUN_001A2BA8`, vértices de 12 bytes lidos com LQ+MTSAB+QFSRV) recebia vértices deslocados. Com a correção
+o Red fica no chão (Y ≈ -0,75 em `0x199CC58`), pula e o tutorial aparece ("Move: left analog stick", HUD com
+munição e vida) — `logs/run_20261017_095303_drive.log`. Marco 11 (primeira fase em gameplay) atingido.
+**Próximo:** jogar com controle de verdade (teclado/gamepad) para ver movimento, tiro e inimigos; depois
+desempenho (3D ~7 qps) e áudio.
+
+**Progresso (2026-10-16 22h): fase 1 carrega e é jogada; Red caía pelo chão.** O "Begin" agora carrega a
+fase de verdade (#48: `PollSema` devolvia -419 em vez de -1 e o carregador cancelava; #49: 9 funções de
+vtable fora do mapa). A cutscene de introdução roda com cenário, personagens e legendas (cabana, alvo,
+cerca, cena com Nate e Falling Star). Ao receber o controle, o Red caía pelo terreno até morrer
+("tentar de novo"). Hipótese do dt (relógio real, 0,1 s a ~7 qps) testada com passo fixo 1/30 (#51):
+**não resolveu** — passos menores, mas a sonda de chão não corrige nada (`logs/run_20261016_221131_drive.log`).
+**Próximo:** descer na sonda `FUN_002C7610` →
+mundo `DAT_004F80AC` (vtable `0x5071C8`, métodos +0xEC `0x2BF990` e +0xF0 `0x2BFBF8`) → bounds (+0x60/+0x64).
+Ferramentas novas: `PS2X_WRITE_WATCH` (#50), `RDR_TRACE_CALLS` (#48), `Callers.java`/`Callees.java`.
+Desempenho continua o gargalo (3D ~7 qps).
+
+**Progresso (2026-10-16 14h): sala do menu desenhada inteira.** A causa era o recompilador: `SQRT.S`
+lia o registrador do campo fs (sempre f0) em vez de ft (#47). Os planos laterais da câmera, normalizados
+com `SQRT.S` em `FUN_003C4338`, saíam 1000× maiores e o teste de frustum `FUN_00153608` descartava
+paredes, chão e fogão. Com #46 (VCLIP) e #47 o escritório do xerife aparece como no PS2 (log
+`logs/run_20261016_142457_drive.log`). A fase do capítulo 1 **continua preta** depois do Begin
+(`logs/run_20261016_142838_drive.log`): 30 fps, só o microprograma 0x1F40 do VU1 e ~33 primitivos por
+quadro; o bloqueio abaixo segue valendo. Também corrigido: `scripts/env.ps1` põe o `vswhere.exe` no
+PATH (o vcvars64 falhava fora de um shell do VS).
+
+**Bloqueio atual (2026-10-16 10h): fase do capítulo 1 carrega mas não aparece.** Com #41 (GetDir do
+cartão) o boot vai direto ao aviso de Autosave e o "Begin" do capítulo funciona. Máquina de estados do
+motor (nó atual em `DAT_0079F158`; transições por nó, condição no método +0x14 de cada transição):
+`FrontEnd` → (`FrontEndToLoad`, cond. `0x234500`: `DAT_0073AF14 == 0` e `FUN_0021DF60(obj, "lvl_perfnew")`)
+→ `NewLoadShow` (objeto `0x69E6C0`, estado em +0x90: 1 preparado, 2 carregando, 4 carregado/aguarda X,
+3 sair) → `LoadToGame` (`0x225B98`: +0x90 == 3 e +0xA0 == 0) → `Game`. A fase é lida (30 leituras de
+`LVLS_SNG/PERFNEW.DAT` + SWAT.DAT), mas em `Game` não há viewport ativa (`DAT_0073C18C = 0`), nada é
+desenhado e não há mais leituras. Som/IOP estáveis (bancos e streams sem pendência). Próximo: descobrir
+o que ativa a câmera/viewport no início da fase (update de Game `FUN_00236568` → `FUN_00182718`; talvez
+a cena de introdução `LoadToIntro` exigisse +0xA0 != 0).
+Ferramentas: `PS2X_WATCH_U32`, `PS2X_CD_TRACE`, F9, `tools/ghidra/XRefs.java`.
+
+**Bloqueio atual (2026-10-16 08h): início do capítulo 1.** Menu → livro "Player in Progress" → X →
+perfil "RED" (Gunslinger Profiles, X confirma) → livro "Chapter 1 – Bull's Eye" → X (Begin) → tela
+preta para sempre. O jogo lê o cabeçalho de `LVLS_SNG/PERFNEW.DAT` (setores 0 e 2796) e para de ler o
+disco; a thread principal continua no laço do front-end (`FUN_00101BA8`, retorno em 0x102A24), sem
+desenhar. Corrigido no caminho: música (`STREAMS.DAT;1;1`, #38), busca de CD do IOP (#37), alocador
+do IOP (#39), prioridade do mcserv HLE (#40). Pendente: descobrir o que o front-end espera
+(variáveis do script de UI `playerChoice`/`loadIt`/`saving1`; gerenciador do cartão `FUN_003F0348`).
+Teclas do roteiro: `drive.ps1 -MenuKeys "6:20:400,20:20:400,85:20:400,..."` (X a cada ~25 s).
+A sala do menu (abaixo) continua pendente.
+
+**Bloqueio atual (23h): sala do menu não é desenhada.** O menu real é o escritório do xerife
+(paredes de tijolo, fogão, escrivaninha; imagem de referência do usuário). Aqui só livros, pôsteres e o
+escorpião chegam ao GS; por baixo aparece a grade de depuração do motor (textura "grid" 8x8 de cores
+aleatórias, plano de 100x100). Descartados: GS (endereçamento PSMCT32/16/T8/T4 conferido com o PCSX2,
+truque de 16/32 bits do sépia idêntico ao esperado), recorte do VU1 (`PS2X_VU1_CLIP_ZERO` não muda a
+lista), microprogramas (0x10 e 0x1F40 são só configuração; todo desenho passa pelo de 0x0 e todo
+XGKICK termina), leitura de disco (FRONT.DAT lido inteiro, sem erro). Corrigida a semântica da FPU do
+EE/VU0 (FUNCOES.md #35) — necessária, mas não resolveu. Hipóteses abertas: a sala não chega ao VU1
+(descarte no EE: visibilidade/setores; ou não instanciada), ou o EE monta a lista dela num caminho que
+falha em silêncio. Ferramentas novas: F9 (FUNCOES.md #36), `PS2X_CD_TRACE`.
+
 **Resumo 2026-10-15 (19h45): MENU PRINCIPAL ALCANÇADO.** Fluxo: ... Demo Mode → Start → vídeo do
 Red no deserto (título) → Start → **menu de livros** ("Player in Progress", "X Enter / O Options").
 Correções: FUNCOES.md #30 (BindRpc IOP→EE 0xADDA fingido), #31 (ioman do IOP: open/read/lseek/close →

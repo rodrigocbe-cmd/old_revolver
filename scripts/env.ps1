@@ -12,6 +12,8 @@ if (-not $vsPath) { throw "vcvars64.bat nao encontrado (instale a carga 'Desenvo
 $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
 
 if (-not $env:VCToolsVersion) {
+    # o vcvars64 chama vswhere.exe pelo PATH; sem ele o stderr vira erro fatal (ErrorActionPreference=Stop)
+    $env:PATH = (Split-Path -Parent $vswhere) + ";$env:PATH"
     cmd /c "`"$vcvars`" >nul && set" | ForEach-Object {
         if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
     }

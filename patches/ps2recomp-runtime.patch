@@ -1,8 +1,31 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..7f55a23 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -49,8 +49,8 @@ namespace ps2x::iop
+     struct MemoryCardRequest
+     {
+         MemoryCardOperation operation = MemoryCardOperation::Init;
+-        // The fifth argument is carried in $t0 by the EE n32 ABI
+-        std::array<uint32_t, 5> arguments{};
++        // The fifth and sixth arguments are carried in $t0/$t1 by the EE n32 ABI
++        std::array<uint32_t, 6> arguments{};
+     };
+ 
+     class IopHost
 diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
-index 25e9b36..62196b2 100644
+index 25e9b36..08206c8 100644
 --- a/ps2xIOP/src/emulator/core/iop_memory.cpp
 +++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
-@@ -213,6 +213,12 @@ namespace ps2x::iop::detail
+@@ -2,6 +2,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <vector>
+ 
+ namespace ps2x::iop::detail
+ {
+@@ -213,6 +214,12 @@ namespace ps2x::iop::detail
  
      uint32_t IopMemory::readHardware32(uint32_t address) const
      {
@@ -15,6 +38,198 @@ index 25e9b36..62196b2 100644
          const auto value = m_hardware.find(address);
          if (value != m_hardware.end())
              return value->second;
+@@ -299,7 +306,10 @@ namespace ps2x::iop::detail
+             return address;
+         }
+ 
+-        uint32_t candidate = alignUp(m_heapCursor, alignment);
++        // First-fit a partir do inicio do heap: blocos liberados (FreeSysMemory) voltam a ser usados.
++        // Antes a busca comecava em m_heapCursor e o AGESND esgotava o heap com buffers de stream
++        // alocados/liberados repetidamente. FUNCOES.md #39.
++        uint32_t candidate = alignUp(HeapBase, alignment);
+         for (;;)
+         {
+             bool overlap = false;
+@@ -339,7 +349,23 @@ namespace ps2x::iop::detail
+ 
+     uint32_t IopMemory::maxFreeMemory() const
+     {
+-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
++        std::vector<Allocation> blocks;
++        for (const auto &block : m_allocations)
++            if (block.address + block.size > HeapBase && block.address < HeapLimit)
++                blocks.push_back(block);
++        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b)
++                  { return a.address < b.address; });
++        uint32_t largest = 0u;
++        uint32_t cursor = HeapBase;
++        for (const auto &block : blocks)
++        {
++            if (block.address > cursor)
++                largest = std::max(largest, block.address - cursor);
++            cursor = std::max(cursor, block.address + block.size);
++        }
++        if (HeapLimit > cursor)
++            largest = std::max(largest, HeapLimit - cursor);
++        return largest;
+     }
+ 
+     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index a932a5d..c695955 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -22,7 +22,9 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
+-        static constexpr uint32_t HeapBase = 0x00120000u;
++        // Modulos do Red Dead Revolver (12 IRX) terminam por volta de 0x90000; o heap comecava em
++        // 0x120000 e o AGESND ficava sem memoria para os bancos de som da fase. FUNCOES.md #39.
++        static constexpr uint32_t HeapBase = 0x000A0000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+         struct Allocation
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index ad58fb4..bf712a3 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <limits>
+@@ -63,6 +64,12 @@ namespace ps2x::iop::detail
+                 destination[i] = static_cast<uint8_t>(value >> (i * 8u));
+         }
+ 
++        uint32_t readLe32(const uint8_t *source)
++        {
++            return static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8u) |
++                   (static_cast<uint32_t>(source[2]) << 16u) | (static_cast<uint32_t>(source[3]) << 24u);
++        }
++
+         void writeBe32(uint8_t *destination, uint32_t value)
+         {
+             for (uint32_t i = 0u; i < 4u; ++i)
+@@ -594,12 +601,114 @@ namespace ps2x::iop::detail
+             return &nodes[current];
+         }
+ 
++        bool readImageSectors(uint32_t lsn, uint32_t sectors, std::vector<uint8_t> &out)
++        {
++            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++            if (imagePath.empty())
++                return false;
++            if (imageHandle == 0u)
++                imageHandle = host.openHostFile(imagePath);
++            if (imageHandle == 0u)
++                return false;
++            out.assign(static_cast<size_t>(sectors) * kSectorSize, 0u);
++            size_t bytesRead = 0u;
++            return host.readHostFile(imageHandle, static_cast<uint64_t>(lsn) * kSectorSize, out.data(), out.size(), bytesRead) &&
++                   bytesRead == out.size();
++        }
++
++        // Com imagem de disco configurada, sceCdRead le a ISO real; a busca tem de usar o diretorio
++        // ISO9660 dessa mesma imagem (os LSNs da ISO virtual montada da pasta sao outros). FUNCOES.md #37.
++        bool searchImageFile(std::string_view guestPath, uint32_t &lsn, uint32_t &size, std::string &leaf)
++        {
++            const ParsedPs2Path parsed = parsePs2Path(guestPath);
++            if (!parsed || parsed.device != Ps2PathDevice::Cdrom)
++                return false;
++            std::vector<uint8_t> pvd;
++            if (!readImageSectors(16u, 1u, pvd) || pvd[0] != 1u || std::memcmp(pvd.data() + 1u, "CD001", 5u) != 0)
++                return false;
++            uint32_t dirLsn = readLe32(pvd.data() + 156u + 2u);
++            uint32_t dirSize = readLe32(pvd.data() + 156u + 10u);
++
++            size_t begin = 0u;
++            while (begin <= parsed.path.size())
++            {
++                const size_t end = parsed.path.find('/', begin);
++                const size_t length = (end == std::string::npos) ? parsed.path.size() - begin : end - begin;
++                const std::string_view component(parsed.path.data() + begin, length);
++                const bool last = end == std::string::npos;
++                begin = last ? parsed.path.size() + 1u : end + 1u;
++                if (component.empty() || component == ".")
++                    continue;
++
++                std::vector<uint8_t> dir;
++                if (dirSize == 0u || dirSize > 16u * 1024u * 1024u ||
++                    !readImageSectors(dirLsn, (dirSize + kSectorSize - 1u) / kSectorSize, dir))
++                    return false;
++                const std::string wanted = normalizedIsoComponent(component);
++                bool found = false;
++                size_t offset = 0u;
++                while (offset < dir.size())
++                {
++                    const uint8_t recordLength = dir[offset];
++                    if (recordLength == 0u)
++                    {
++                        offset = (offset / kSectorSize + 1u) * kSectorSize;
++                        continue;
++                    }
++                    if (offset + recordLength > dir.size() || recordLength < 34u)
++                        break;
++                    const uint8_t nameLength = dir[offset + 32u];
++                    const std::string_view name(reinterpret_cast<const char *>(dir.data() + offset + 33u), nameLength);
++                    if (nameLength > 0u && name[0] > 1 && normalizedIsoComponent(name) == wanted)
++                    {
++                        dirLsn = readLe32(dir.data() + offset + 2u);
++                        dirSize = readLe32(dir.data() + offset + 10u);
++                        if (last)
++                        {
++                            lsn = dirLsn;
++                            size = dirSize;
++                            leaf = normalizedIsoComponent(name);
++                        }
++                        found = true;
++                        break;
++                    }
++                    offset += recordLength;
++                }
++                if (!found)
++                    return false;
++                if (last)
++                    return true;
++            }
++            return false;
++        }
++
+         bool searchFile(uint32_t resultAddress, uint32_t nameAddress)
+         {
+             if (resultAddress == 0u || nameAddress == 0u)
+                 return false;
+ 
+             const std::string guestPath = memory.readString(nameAddress, 1024u);
++            {
++                uint32_t lsn = 0u;
++                uint32_t size = 0u;
++                std::string leaf;
++                const bool foundInImage = searchImageFile(guestPath, lsn, size, leaf);
++                static uint32_t s_searchLogs = 0u;
++                if (s_searchLogs < 32u)
++                {
++                    ++s_searchLogs;
++                    std::fprintf(stderr, "[iop-cdvd] SearchFile '%s' -> %s lsn=%u size=%u\n", guestPath.c_str(),
++                                 foundInImage ? "imagem" : "nao achou na imagem", lsn, size);
++                }
++                if (foundInImage)
++                {
++                    std::array<uint8_t, 32u> result{};
++                    writeLe32(result.data(), lsn);
++                    writeLe32(result.data() + 4u, size);
++                    std::memcpy(result.data() + 8u, leaf.data(), std::min<size_t>(16u, leaf.size()));
++                    return memory.writeRam(resultAddress, result.data(), result.size());
++                }
++            }
+             IsoNode *node = findVirtualIsoNode(guestPath);
+             if (!node)
+                 return false;
 diff --git a/ps2xIOP/src/emulator/imports/iop_ioman.cpp b/ps2xIOP/src/emulator/imports/iop_ioman.cpp
 index 3eb4119..98eebf4 100644
 --- a/ps2xIOP/src/emulator/imports/iop_ioman.cpp
@@ -224,11 +439,47 @@ index 182f786..9267e49 100644
 +        int32_t m_nextFd = 3;
      };
  }
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 2c8d8f7..c20c111 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "iop_sysmem.h"
+ 
+ #include "../core/iop_cpu.h"
+@@ -30,6 +31,16 @@ namespace ps2x::iop::detail
+             const uint32_t address = a0 == 2u
+                                          ? m_memory.allocate(a1, 16u, a2)
+                                          : m_memory.allocate(a1, 16u);
++            if (address == 0u)
++            {
++                static uint32_t s_allocFailLogs = 0u;
++                if (s_allocFailLogs < 32u)
++                {
++                    ++s_allocFailLogs;
++                    std::fprintf(stderr, "[iop-sysmem] AllocSysMemory(type=%u, size=0x%x) falhou; maior livre=0x%x\n",
++                                 a0, a1, m_memory.maxFreeMemory());
++                }
++            }
+             setV0(address);
+             return true;
+         }
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..83ed1dc 100644
+index e5f63a9..5ba1a77 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -105,7 +105,7 @@ namespace ps2x::iop::detail
+@@ -18,6 +18,9 @@
+ #include "iop_emulator_const.h"
+ 
+ #include <algorithm>
++#include <vector>
++#include <cstdlib>
++#include <cstdio>
+ #include <cctype>
+ #include <map>
+ #include <optional>
+@@ -105,7 +108,7 @@ namespace ps2x::iop::detail
                heaplib(memory),
                intrman(memory),
                timrman(),
@@ -237,6 +488,69 @@ index e5f63a9..83ed1dc 100644
                cpuCore(memory),
                imports(memory),
                loadcore(memory, imports)
+@@ -558,12 +561,24 @@ namespace ps2x::iop::detail
+             try
+             {
+                 const uint64_t target = totalCycles + cycles;
++                // Desempenho (FUNCOES.md #44): threads do IOP que nunca bloqueiam (ex.: laco de servico
++                // do AGESND) consumiam todo o clock do IOP interpretado (~28% da thread do jogo). Depois
++                // que o IOP ficou ocupado por PS2X_IOP_BUSY_PERCENT% (padrao 25) do intervalo pedido,
++                // o resto do intervalo avanca de evento em evento, como quando nao ha thread pronta.
++                static const uint64_t s_busyPercent = []()
++                {
++                    const char *env = std::getenv("PS2X_IOP_BUSY_PERCENT");
++                    const long value = env ? std::strtol(env, nullptr, 10) : 25L;
++                    return static_cast<uint64_t>(std::clamp<long>(value, 1L, 100L));
++                }();
++                const uint64_t busyBudget = std::max<uint64_t>(cycles * s_busyPercent / 100u, 1u);
++                uint64_t busyCycles = 0u;
+                 while (totalCycles < target)
+                 {
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+                     timrman.serviceDue(totalCycles, *this);
+-                    IopThread *next = kernel.beginNextReady(totalCycles);
++                    IopThread *next = busyCycles < busyBudget ? kernel.beginNextReady(totalCycles) : nullptr;
+                     if (!next)
+                     {
+                         uint64_t nextWake = kernel.nextWakeCycle(target);
+@@ -577,9 +592,36 @@ namespace ps2x::iop::detail
+                     }
+                     const uint64_t before = totalCycles;
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
++                    {
++                        // Debug/desempenho: PS2X_IOP_PROFILE=1 amostra o PC de cada fatia de CPU do IOP e
++                        // imprime os enderecos mais frequentes (blocos de 0x40) a cada 50 mil fatias.
++                        static const bool s_iopProfile = std::getenv("PS2X_IOP_PROFILE") != nullptr;
++                        if (s_iopProfile)
++                        {
++                            static std::map<uint32_t, uint64_t> s_hist;
++                            static uint64_t s_slices = 0u;
++                            static uint64_t s_cycles = 0u;
++                            ++s_hist[next->cpu.pc & ~0x3Fu];
++                            s_cycles += totalCycles - before;
++                            if (++s_slices % 50000u == 0u)
++                            {
++                                std::vector<std::pair<uint64_t, uint32_t>> top;
++                                for (const auto &[pc, count] : s_hist)
++                                    top.push_back({count, pc});
++                                std::sort(top.rbegin(), top.rend());
++                                std::fprintf(stderr, "[iop-prof] fatias=%llu ciclos=%llu top:", static_cast<unsigned long long>(s_slices),
++                                             static_cast<unsigned long long>(s_cycles));
++                                for (size_t i = 0; i < top.size() && i < 12u; ++i)
++                                    std::fprintf(stderr, " %05x:%llu", top[i].second, static_cast<unsigned long long>(top[i].first));
++                                std::fprintf(stderr, " | thread=%d\n", static_cast<int>(next->id));
++                                s_hist.clear();
++                            }
++                        }
++                    }
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
++                    busyCycles += totalCycles - before;
+                 }
+             }
+             catch (...)
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 index cf4fdc6..94274a8 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
@@ -297,8 +611,42 @@ index cf4fdc6..94274a8 100644
          case 12: // sceSifSendCmd
          case 13: // isceSifSendCmd
          {
+diff --git a/ps2xIOP/src/iop_service.h b/ps2xIOP/src/iop_service.h
+index 79fed4f..e814f86 100644
+--- a/ps2xIOP/src/iop_service.h
++++ b/ps2xIOP/src/iop_service.h
+@@ -33,6 +33,13 @@ namespace ps2x::iop::detail
+ 
+         [[nodiscard]] virtual RpcResult handleRpc(const RpcRequest &request) = 0;
+ 
++        // true: o servico HLE atende antes do servidor registrado por um IRX emulado com o mesmo SID
++        // (o IRX real depende de hardware que o IOP emulado nao tem, ex.: cartao de memoria via SIO2).
++        [[nodiscard]] virtual bool preferOverEmulated() const
++        {
++            return false;
++        }
++
+         virtual void onSifTransfer(const SifTransfer &transfer)
+         {
+             (void)transfer;
+diff --git a/ps2xIOP/src/iop_subsystem.cpp b/ps2xIOP/src/iop_subsystem.cpp
+index b498155..cb31c83 100644
+--- a/ps2xIOP/src/iop_subsystem.cpp
++++ b/ps2xIOP/src/iop_subsystem.cpp
+@@ -199,6 +199,11 @@ namespace ps2x::iop
+         const auto route = m_impl->routes.find(request.sid);
+         detail::IopService *hle = route != m_impl->routes.end() ? route->second : nullptr;
+ 
++        // FUNCOES.md #40: com o heap do IOP corrigido (#39) o MCSERV.IRX real passou a registrar o
++        // servidor 0x80000400 e, sem SIO2 emulado, respondia 0 a tudo (GetSlotMax = 0 em laco).
++        if (hle && hle->preferOverEmulated())
++            return hle->handleRpc(request);
++
+         RpcResult emulated = m_impl->emulator.handleRpc(request);
+         if (emulated.handled || !hle)
+         {
 diff --git a/ps2xIOP/src/modules/mcserv.cpp b/ps2xIOP/src/modules/mcserv.cpp
-index ce23759..7219e39 100644
+index ce23759..5d7b82e 100644
 --- a/ps2xIOP/src/modules/mcserv.cpp
 +++ b/ps2xIOP/src/modules/mcserv.cpp
 @@ -1,3 +1,4 @@
@@ -336,14 +684,26 @@ index ce23759..7219e39 100644
              default:
                  break;
              }
-@@ -242,6 +248,18 @@ namespace ps2x::iop::detail
+@@ -180,6 +186,11 @@ namespace ps2x::iop::detail
+                 (void)call(MemoryCardOperation::Init);
+             }
+ 
++            [[nodiscard]] bool preferOverEmulated() const override
++            {
++                return true; // o cartao de memoria e emulado no host, nao no SIO2 do IOP
++            }
++
+             [[nodiscard]] RpcResult handleRpc(const RpcRequest &request) override
+             {
+                 RpcResult response{};
+@@ -242,6 +253,18 @@ namespace ps2x::iop::detail
                      }
                  }
  
 +                {
 +                    // Debug: memory card RPC trace (function number, name parameter if any, result).
 +                    static uint32_t s_mcTraceCount = 0u;
-+                    if (s_mcTraceCount < 200u && request.function != 0x01u)
++                    if (s_mcTraceCount < 400u && request.function != 0x15u)
 +                    {
 +                        ++s_mcTraceCount;
 +                        char name[64] = {};
@@ -355,7 +715,37 @@ index ce23759..7219e39 100644
                  writeResult(request.receive, result);
                  return response;
              }
-@@ -366,6 +384,8 @@ namespace ps2x::iop::detail
+@@ -258,9 +281,10 @@ namespace ps2x::iop::detail
+                          uint32_t a1 = 0u,
+                          uint32_t a2 = 0u,
+                          uint32_t a3 = 0u,
+-                         uint32_t stackArgument = 0u)
++                         uint32_t stackArgument = 0u,
++                         uint32_t sixthArgument = 0u)
+             {
+-                return m_host.memoryCard({operation, {a0, a1, a2, a3, stackArgument}});
++                return m_host.memoryCard({operation, {a0, a1, a2, a3, stackArgument, sixthArgument}});
+             }
+ 
+             void writeResult(GuestBuffer receive, int32_t result)
+@@ -296,9 +320,13 @@ namespace ps2x::iop::detail
+                 case Operation::Delete:
+                     return call(MemoryCardOperation::Delete, port, slot, nameAddress);
+                 case Operation::GetDir:
+-                    // MCSERV normally DMA-writes entries. The existing HLE returns
+-                    // zero entries instead of fabricating directory contents.
+-                    return kSucceeded;
++                    // sceMcGetDir(port, slot, name, mode, maxent, table): o runtime lista a pasta do
++                    // cartao emulado e escreve a tabela direto na RAM do EE (o MCSERV real usaria DMA).
++                    // Antes devolvia sempre 0 entradas; para uma pasta inexistente o correto e -4, e o
++                    // Red Dead Revolver tratava 0 como save corrompido (FUNCOES.md #41).
++                    return call(MemoryCardOperation::GetDir, port, slot, nameAddress,
++                                static_cast<uint32_t>(parameter.flags),
++                                static_cast<uint32_t>(parameter.maxEntries), parameter.pointer);
+                 case Operation::GetEnt:
+                     return 1024;
+                 default:
+@@ -366,6 +394,8 @@ namespace ps2x::iop::detail
                                  static_cast<uint32_t>(parameter.slot));
                  case Operation::ChangePriority:
                      return kSucceeded;
@@ -363,6 +753,167 @@ index ce23759..7219e39 100644
 +                    return 1; // one slot per port (no multitap)
                  default:
                      return kDenied;
+                 }
+diff --git a/ps2xIOP/src/ps2_path.cpp b/ps2xIOP/src/ps2_path.cpp
+index 420f053..78308ea 100644
+--- a/ps2xIOP/src/ps2_path.cpp
++++ b/ps2xIOP/src/ps2_path.cpp
+@@ -21,16 +21,23 @@ namespace ps2x::iop
+             while (!suffix.empty() && suffix.front() == '/')
+                 suffix.erase(suffix.begin());
+ 
+-            const size_t semicolon = suffix.rfind(';');
+-            if (semicolon == std::string::npos || semicolon + 1u == suffix.size())
+-                return;
++            // Remove sufixos de versao ISO9660, inclusive repetidos: a camada de arquivos do Red Dead
++            // Revolver acrescenta ";1" a caminhos que ja tem ";1" ("STREAMS.DAT;1;1"); o driver de CD
++            // do PS2 compara o nome so ate o primeiro ';'. FUNCOES.md #38.
++            while (true)
++            {
++                const size_t semicolon = suffix.rfind(';');
++                if (semicolon == std::string::npos || semicolon + 1u == suffix.size())
++                    return;
+ 
+-            const bool numeric = std::all_of(suffix.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u),
+-                                             suffix.end(),
+-                                             [](unsigned char ch)
+-                                             { return std::isdigit(ch) != 0; });
+-            if (numeric)
++                const bool numeric = std::all_of(suffix.begin() + static_cast<std::ptrdiff_t>(semicolon + 1u),
++                                                 suffix.end(),
++                                                 [](unsigned char ch)
++                                                 { return std::isdigit(ch) != 0; });
++                if (!numeric)
++                    return;
+                 suffix.erase(semicolon);
++            }
+         }
+     }
+ 
+diff --git a/ps2xRecomp/src/lib/fpu_translator.cpp b/ps2xRecomp/src/lib/fpu_translator.cpp
+index 944cee7..02be573 100644
+--- a/ps2xRecomp/src/lib/fpu_translator.cpp
++++ b/ps2xRecomp/src/lib/fpu_translator.cpp
+@@ -53,12 +53,14 @@ namespace ps2recomp
+             case COP1_S_MUL:
+                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_DIV:
+-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
+-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
+-                                   ft, fd, fs, fd, fs, ft);
++                // EE: divisao por zero da +-FLT_MAX (sinal fs xor ft), nunca Inf/NaN
++                return fmt::format("if (ctx->f[{}] == 0.0f) ctx->fcr31 |= 0x100000; /* DZ flag */ "
++                                   "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]);",
++                                   ft, fd, fs, ft);
+             case COP1_S_SQRT:
+-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
++                // EE: SQRT.S fd, ft (o operando fica no campo ft; fs vem zerado). Antes usava fs e
++                // calculava sqrt(f0): planos de camera 1000x maiores no Red Dead Revolver (FUNCOES.md #47).
++                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
+             case COP1_S_ABS:
+                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
+             case COP1_S_MOV:
+@@ -76,7 +78,8 @@ namespace ps2recomp
+             case COP1_S_CVT_W:
+                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
+             case COP1_S_RSQRT:
+-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
++                // EE: RSQRT.S fd = fs / sqrt(ft)
++                return fmt::format("ctx->f[{}] = FPU_RSQRT_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+             case COP1_S_ADDA:
+                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
+             case COP1_S_SUBA:
+diff --git a/ps2xRecomp/src/lib/instruction_translator.cpp b/ps2xRecomp/src/lib/instruction_translator.cpp
+index 7684097..da23d89 100644
+--- a/ps2xRecomp/src/lib/instruction_translator.cpp
++++ b/ps2xRecomp/src/lib/instruction_translator.cpp
+@@ -195,10 +195,13 @@ namespace ps2recomp
+             return genWrite(16, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("(uint16_t)GPR_U32(ctx, {})", inst.rt)) + ";";
+         case OPCODE_SW:
+             return genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_U32(ctx, {})", inst.rt)) + ";";
++        // EE: LQ/SQ/LQC2/SQC2 ignoram os 4 bits baixos do endereco (sempre o quadword alinhado). O Red Dead
++        // Revolver le vertices de 12 bytes com LQ+LQ+MTSAB+QFSRV; lendo no endereco exato o QFSRV deslocava
++        // de novo e o teste de triangulo do chao falhava (personagem caia pelo terreno, FUNCOES.md #52).
+         case OPCODE_LQ:
+-            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
++            return fmt::format("SET_GPR_VEC(ctx, {}, {});", inst.rt, genRead(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate)));
+         case OPCODE_SQ:
+-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
++            return genWrite(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate), fmt::format("GPR_VEC(ctx, {})", inst.rt)) + ";";
+         case OPCODE_LD:
+             return fmt::format("SET_GPR_U64(ctx, {}, {});", inst.rt, genRead(64, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+         case OPCODE_SD:
+@@ -211,9 +214,9 @@ namespace ps2recomp
+                 inst.rt,
+                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
+         case OPCODE_LDC2:
+-            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
++            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate)));
+         case OPCODE_SDC2:
+-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
++            return genWrite(128, fmt::format("(ADD32(GPR_U32(ctx, {}), {}) & ~0xFu)", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+         case OPCODE_DADDI:
+             return fmt::format(
+                 "{{ int64_t src = (int64_t)GPR_S64(ctx, {}); "
+diff --git a/ps2xRecomp/src/lib/vu_translation_helpers.cpp b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+index 509fd07..cb7fc27 100644
+--- a/ps2xRecomp/src/lib/vu_translation_helpers.cpp
++++ b/ps2xRecomp/src/lib/vu_translation_helpers.cpp
+@@ -75,21 +75,24 @@ namespace ps2recomp
+         uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+ 
+-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fpu_div(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
+     {
+         uint8_t ftf = inst.vectorInfo.ftf;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fpu_sqrt(ft); }}", ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
+     {
++        // VU: Q = fs.fsf / sqrt(ft.ftf) (o numerador nao e 1)
++        uint8_t fsf = inst.vectorInfo.fsf;
+         uint8_t ftf = inst.vectorInfo.ftf;
++        uint8_t fs_reg = inst.rd;
+         uint8_t ft_reg = inst.rt;
+-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
++        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_fpu_rsqrt(fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+     }
+ 
+     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
+diff --git a/ps2xRecomp/src/lib/vu_translator.cpp b/ps2xRecomp/src/lib/vu_translator.cpp
+index d0fc95d..1339ea3 100644
+--- a/ps2xRecomp/src/lib/vu_translator.cpp
++++ b/ps2xRecomp/src/lib/vu_translator.cpp
+@@ -268,15 +268,18 @@ namespace ps2recomp
+ 
+                     return fmt::format(
+                         "{{ __m128 fs = ctx->vu0_vf[{}]; "
+-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
++                        // VU: compara com |w|; bit par = +eixo (fs > +|w|), bit impar = -eixo (fs < -|w|):
++                        // +x=0x01 -x=0x02 +y=0x04 -y=0x08 +z=0x10 -z=0x20. Antes os pares estavam trocados
++                        // e usava w com sinal (Red Dead Revolver: culling de malhas, FUNCOES.md #46).
++                        "__m128 ft = _mm_and_ps(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}), _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF))); "
+                         "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
+                         "__m128 gt = _mm_cmpgt_ps(fs, ft); "
+                         "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
+                         "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
+                         "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
+-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
+-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
+-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
++                        "uint32_t flags = ((gt_mask & 0x1) << 0) | ((lt_mask & 0x1) << 1) | "
++                        "((gt_mask & 0x2) << 1) | ((lt_mask & 0x2) << 2) | "
++                        "((gt_mask & 0x4) << 2) | ((lt_mask & 0x4) << 3); "
+                         "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
+                         inst.rd, inst.rt, inst.rt, shuffle_pattern);
                  }
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
 index 589d768..699f44e 100644
@@ -388,6 +939,210 @@ index 589d768..699f44e 100644
          PS2_FUNCTION_LOG_TRACKER=1
      )
  endif()
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index 4b9242c..9bdf602 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -237,6 +237,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
+     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
+ }
+ 
++// Vigia de escrita (PS2X_WRITE_WATCH=0xADDR[:bytes]): cada store do codigo gerado passa por aqui; quando
++// toca a faixa vigiada, ps2ReportGuestWrite registra o PC exato (ctx->pc e atualizado por instrucao).
++inline uint32_t g_ps2WriteWatchLo = 0xFFFFFFFFu;
++inline uint32_t g_ps2WriteWatchHi = 0u;
++void ps2ReportGuestWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const char *op,
++                         const R5900Context *ctx);
++
+ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                uint32_t guestAddr,
+                                uint32_t size,
+@@ -246,13 +253,9 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+                                const R5900Context *ctx)
+ {
+     (void)rdram;
+-    (void)guestAddr;
+-    (void)size;
+-    (void)valueLo;
+-    (void)valueHi;
+-    (void)op;
+-    (void)ctx;
+-    // TODO we dont need this anymore so on next release it will be deleted
++    const uint32_t phys = guestAddr & PS2_RAM_MASK;
++    if (phys < g_ps2WriteWatchHi && phys + size > g_ps2WriteWatchLo) [[unlikely]]
++        ps2ReportGuestWrite(guestAddr, size, valueLo, valueHi, op, ctx);
+ }
+ 
+ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+@@ -262,11 +265,9 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
+                                     const R5900Context *ctx)
+ {
+     (void)rdram;
+-    (void)guestAddr;
+-    (void)size;
+-    (void)op;
+-    (void)ctx;
+-    // TODO we dont need this anymore so on next release it will be deleted
++    const uint32_t phys = guestAddr & PS2_RAM_MASK;
++    if (phys < g_ps2WriteWatchHi && phys + size > g_ps2WriteWatchLo) [[unlikely]]
++        ps2ReportGuestWrite(guestAddr, size, 0u, 0u, op, ctx);
+ }
+ 
+ class PS2Runtime
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 0f19c9f..ba32c01 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -141,11 +141,17 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
+ #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
+ 
+ // PS2 VU (Vector Unit) operations
+-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
+-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
+-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
+-#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
+-#define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
++// O VU tambem satura em +-FLT_MAX (sem Inf/NaN); _mm_min_ps devolve o 2o operando se o 1o for NaN.
++inline __m128 ps2_vu_clamp(__m128 value)
++{
++    const __m128 maxValue = _mm_set1_ps(3.402823466e+38f);
++    return _mm_max_ps(_mm_min_ps(value, maxValue), _mm_set1_ps(-3.402823466e+38f));
++}
++#define PS2_VADD(a, b) ps2_vu_clamp(_mm_add_ps((__m128)(a), (__m128)(b)))
++#define PS2_VSUB(a, b) ps2_vu_clamp(_mm_sub_ps((__m128)(a), (__m128)(b)))
++#define PS2_VMUL(a, b) ps2_vu_clamp(_mm_mul_ps((__m128)(a), (__m128)(b)))
++#define PS2_VDIV(a, b) ps2_vu_clamp(_mm_div_ps((__m128)(a), (__m128)(b)))
++#define PS2_VMULQ(a, q) ps2_vu_clamp(_mm_mul_ps((__m128)(a), _mm_set1_ps(q)))
+ #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
+ 
+ // Memory access helpers - Hybrid Fast/Slow Path
+@@ -604,12 +610,74 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
+ 
+ // FPU (COP1) operations
++// A FPU do EE nao e IEEE: nunca produz Inf/NaN (resultados saturam em +-FLT_MAX), divisao por zero
++// da +-FLT_MAX com o sinal de (fs xor ft), SQRT usa |x| e CVT.W.S sempre trunca (com saturacao).
++// Ver docs/FUNCOES.md #35 (Red Dead Revolver: objetos sumiam por Inf/NaN em testes de visibilidade).
++inline float ps2_fpu_clamp(float value)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    if ((bits & 0x7F800000u) == 0x7F800000u)
++        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++    else if ((bits & 0x7F800000u) == 0u)
++        bits &= 0x80000000u; // denormal -> zero
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++inline uint32_t ps2_fpu_sign(float value)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    return bits & 0x80000000u;
++}
++
++inline float ps2_fpu_max_signed(uint32_t sign)
++{
++    const uint32_t bits = sign | 0x7F7FFFFFu;
++    float value;
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++inline float ps2_fpu_div(float a, float b)
++{
++    if (ps2_fpu_clamp(b) == 0.0f)
++        return ps2_fpu_max_signed(ps2_fpu_sign(a) ^ ps2_fpu_sign(b));
++    return ps2_fpu_clamp(ps2_fpu_clamp(a) / ps2_fpu_clamp(b));
++}
++
++inline float ps2_fpu_sqrt(float a)
++{
++    return ps2_fpu_clamp(sqrtf(fabsf(ps2_fpu_clamp(a))));
++}
++
++// RSQRT.S (EE) e RSQRT (VU): fs / sqrt(ft)
++inline float ps2_fpu_rsqrt(float a, float b)
++{
++    const float root = sqrtf(fabsf(ps2_fpu_clamp(b)));
++    if (root == 0.0f)
++        return ps2_fpu_max_signed(ps2_fpu_sign(a));
++    return ps2_fpu_clamp(ps2_fpu_clamp(a) / root);
++}
++
++inline int32_t ps2_fpu_cvt_w(float a)
++{
++    const float v = ps2_fpu_clamp(a);
++    if (v >= 2147483648.0f)
++        return 0x7FFFFFFF;
++    if (v <= -2147483648.0f)
++        return static_cast<int32_t>(0x80000000u);
++    return static_cast<int32_t>(v); // trunca em direcao a zero
++}
++
+ #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
+-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
+-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
+-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
+-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+-#define FPU_SQRT_S(a) sqrtf((float)(a))
++#define FPU_ADD_S(a, b) ps2_fpu_clamp((float)(a) + (float)(b))
++#define FPU_SUB_S(a, b) ps2_fpu_clamp((float)(a) - (float)(b))
++#define FPU_MUL_S(a, b) ps2_fpu_clamp((float)(a) * (float)(b))
++#define FPU_DIV_S(a, b) ps2_fpu_div((float)(a), (float)(b))
++#define FPU_SQRT_S(a) ps2_fpu_sqrt((float)(a))
++#define FPU_RSQRT_S(a, b) ps2_fpu_rsqrt((float)(a), (float)(b))
+ #define FPU_ABS_S(a) fabsf((float)(a))
+ #define FPU_MOV_S(a) ((float)(a))
+ #define FPU_NEG_S(a) (-(float)(a))
+@@ -618,29 +686,30 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
+ #define FPU_CEIL_L_S(a) ((int64_t)ceilf((float)(a)))
+ #define FPU_FLOOR_L_S(a) ((int64_t)floorf((float)(a)))
+ #define FPU_ROUND_W_S(a) ((int32_t)nearbyintf((float)(a)))
+-#define FPU_TRUNC_W_S(a) ((int32_t)(float)(a))
++#define FPU_TRUNC_W_S(a) ps2_fpu_cvt_w((float)(a))
+ #define FPU_CEIL_W_S(a) ((int32_t)ceilf((float)(a)))
+ #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
+ #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
+ #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
+-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
++#define FPU_CVT_W_S(a) ps2_fpu_cvt_w((float)(a))
+ #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
++// Comparacoes: operandos saturados (padroes Inf/NaN vindos da memoria valem +-FLT_MAX no EE)
+ #define FPU_C_F_S(a, b) (0)
+-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_UN_S(a, b) (0)
++#define FPU_C_EQ_S(a, b) (ps2_fpu_clamp((float)(a)) == ps2_fpu_clamp((float)(b)))
++#define FPU_C_UEQ_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_OLT_S(a, b) (ps2_fpu_clamp((float)(a)) < ps2_fpu_clamp((float)(b)))
++#define FPU_C_ULT_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_OLE_S(a, b) (ps2_fpu_clamp((float)(a)) <= ps2_fpu_clamp((float)(b)))
++#define FPU_C_ULE_S(a, b) FPU_C_OLE_S(a, b)
+ #define FPU_C_SF_S(a, b) (0)
+-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
+-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
+-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
+-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
++#define FPU_C_NGLE_S(a, b) (0)
++#define FPU_C_SEQ_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_NGL_S(a, b) FPU_C_EQ_S(a, b)
++#define FPU_C_LT_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_NGE_S(a, b) FPU_C_OLT_S(a, b)
++#define FPU_C_LE_S(a, b) FPU_C_OLE_S(a, b)
++#define FPU_C_NGT_S(a, b) FPU_C_OLE_S(a, b)
+ 
+ // QFSRV: Quadword Funnel Shift Right Variable
+ // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
 index f247ff9..4916e39 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
@@ -402,10 +1157,10 @@ index f247ff9..4916e39 100644
      uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
 diff --git a/ps2xRuntime/include/runtime/gs/gs_draw_stats.h b/ps2xRuntime/include/runtime/gs/gs_draw_stats.h
 new file mode 100644
-index 0000000..9072660
+index 0000000..f3ef306
 --- /dev/null
 +++ b/ps2xRuntime/include/runtime/gs/gs_draw_stats.h
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,32 @@
 +#ifndef PS2_GS_DRAW_STATS_H
 +#define PS2_GS_DRAW_STATS_H
 +
@@ -418,6 +1173,23 @@ index 0000000..9072660
 +
 +    // Debug: named event counters (VIF1 commands, XGKICKs...), reported and reset by takeDrawSummary.
 +    void countEvent(const char *name);
++
++    // Contadores de diagnostico (eventos, desenhos por destino) custam mutex + map por evento; ficam
++    // desligados por padrao e ligam com PS2X_STATS=1. "gs.finish_irq" e sempre contado (medida de fps).
++    bool statsEnabled();
++
++    // Debug: RAM do EE registrada pelo runtime para dumps disparados pelo GS (PS2X_GS_DUMP_TBP).
++    void setEeRam(const unsigned char *ram, unsigned int size);
++    void dumpEeRam(const char *path);
++    void setEeScratchpad(const unsigned char *spr, unsigned int size);
++    void dumpEeScratchpad(const char *path);
++
++    // Debug: log the next `count` GS primitives ([gs:trace], key F9 in the window).
++    void requestPrimTrace(int count);
++    // Returns true (and consumes one unit) while a requested primitive trace is active.
++    bool takePrimTraceSlot();
++    // True while a requested primitive trace is active (does not consume).
++    bool primTraceActive();
 +}
 +
 +#endif // PS2_GS_DRAW_STATS_H
@@ -622,7 +1394,7 @@ index e1be7d2..9159ff1 100644
                  {
                      PS2_IF_AGRESSIVE_LOGS({
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
-index 56a978e..5b1e839 100644
+index 56a978e..a47c068 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
 @@ -1,3 +1,4 @@
@@ -638,7 +1410,22 @@ index 56a978e..5b1e839 100644
          const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
          const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
          const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
-@@ -467,12 +469,14 @@ namespace ps2_stubs
+@@ -313,6 +315,14 @@ namespace ps2_stubs
+             }
+         }
+ 
++        // Debug: PS2X_CD_TRACE=1 registra cada sceCdRead (lbn, setores, destino, resultado).
++        static const bool s_cdTrace = std::getenv("PS2X_CD_TRACE") != nullptr;
++        if (s_cdTrace)
++        {
++            std::fprintf(stderr, "[cd-trace] read lbn=%u sectors=%u buf=0x%x ok=%d args=%s ra=0x%x\n",
++                         selected.lbn, selected.sectors, selected.buf, ok ? 1 : 0, selected.tag, getRegU32(ctx, 31));
++        }
++
+         if (ok)
+         {
+             g_cdStreamingLbn = selected.lbn + selected.sectors;
+@@ -467,12 +477,14 @@ namespace ps2_stubs
  
      void sceCdReadChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
      {
@@ -654,6 +1441,19 @@ index 56a978e..5b1e839 100644
              if (!entry)
              {
                  ok = false;
+@@ -495,7 +507,11 @@ namespace ps2_stubs
+                 bytes = maxBytes;
+             }
+ 
+-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
++            const bool entryOk = readCdSectors(lbn, sectors, rdram + offset, bytes);
++            static const bool s_chainTrace = std::getenv("PS2X_CD_TRACE") != nullptr;
++            if (s_chainTrace)
++                std::fprintf(stderr, "[cd-trace] chain lbn=%u sectors=%u buf=0x%x ok=%d\n", lbn, sectors, buf, entryOk ? 1 : 0);
++            if (!entryOk)
+             {
+                 ok = false;
+                 break;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
 index b1083af..3e0a612 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/FileIO.cpp
@@ -876,6 +1676,23 @@ index 564d873..c111af1 100644
              }
  
              setMcCommandResultLocked(kMcCmdGetInfo, result);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+index dc975ed..2e57c6e 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/SIF.cpp
+@@ -632,7 +632,12 @@ namespace ps2_stubs
+         const uint32_t count = getRegU32(ctx, 5);
+ 
+         const uint32_t listAddr = getRegU32(ctx, 4);
++        // Desempenho: o player de FMV/audio chama isto ~40x/s; log sem limite custava ~30% da thread
++        // do jogo (FUNCOES.md #43). So as primeiras chamadas sao registradas.
++        static uint32_t s_setDmaLogs = 0u;
++        if (s_setDmaLogs < 32u)
+         PS2_IF_AGRESSIVE_LOGS({
++            ++s_setDmaLogs;
+             std::cerr << "[sceSifSetDma:CALL] pc=0x" << std::hex << ctx->pc
+                       << " ra=0x" << getRegU32(ctx, 31)
+                       << " list=0x" << listAddr
 diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp
 index 039da2f..753270e 100644
 --- a/ps2xRuntime/src/lib/Kernel/Syscalls/Deci2.cpp
@@ -984,11 +1801,180 @@ index 07fcd29..1962c00 100644
                  pushSifRpcDebugEvent(event);
              };
  
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
+index 33945fc..47f68b2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Sync.cpp
+@@ -113,8 +113,11 @@ namespace ps2_syscalls
+ 
+     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+-        setReturnS32(ctx,
+-                     scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(getRegU32(ctx, 4))));
++        // No kernel do EE, PollSema devolve o id ou -1 (contador zero/id invalido); os codigos KE_* sao do
++        // IOP. O Red Dead Revolver testa "!= -1": com -419 o carregador de fase via o semaforo de
++        // cancelamento como sinalizado e pulava a fase inteira (FUNCOES.md #48).
++        const int result = scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(getRegU32(ctx, 4)));
++        setReturnS32(ctx, result < 0 ? -1 : result);
+     }
+ 
+     void iPollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+index 9614016..4d4b22f 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/System.cpp
+@@ -45,6 +45,8 @@ namespace ps2_syscalls
+             imr = runtime->memory().gs().imr;
+         }
+ 
++        static uint32_t s_getImrLogs = 0u; // desempenho: chamado varias vezes por quadro (FUNCOES.md #43)
++        if (s_getImrLogs < 32u && ++s_getImrLogs)
+         RUNTIME_LOG("PS2 GsGetIMR: Returning IMR=0x" << std::hex << imr
+                                                      << " pc=0x" << ctx->pc
+                                                      << " ra=0x" << getRegU32(ctx, 31)
+@@ -67,6 +69,8 @@ namespace ps2_syscalls
+             oldImr = runtime->memory().gs().imr;
+             runtime->memory().gs().imr = newImr;
+         }
++        static uint32_t s_putImrLogs = 0u;
++        if (s_putImrLogs < 32u && ++s_putImrLogs)
+         RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << newImr
+                                      << " a0_64=0x" << GPR_U64(ctx, 4)
+                                      << " a0_32=0x" << getRegU32(ctx, 4)
+diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+index f0ad507..6ded1ad 100644
+--- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
+@@ -6,6 +6,11 @@
+ #include "runtime/gs/ps2_gs_psmt8.h"
+ #include "runtime/gs/ps2_gs_memory.h"
+ #include "ps2_log.h"
++#include "runtime/gs/gs_draw_stats.h"
++#include <cstdio>
++#include <vector>
++#include <string>
++#include <cstdlib>
+ #include <atomic>
+ #include <algorithm>
+ #include <cmath>
+@@ -712,6 +717,72 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
+     const GSDrawState &state = batch.state;
+     const auto &ctx = state.context;
++    if (ps2_gs_stats::takePrimTraceSlot())
++    {
++        // PS2X_GS_DUMP_TBP=<tbp0>[,<tbp0>...]: grava VRAM + CLUT ativa na 1a primitiva texturizada
++        // com cada uma dessas texturas (gs_vram_tbp_<tbp0>.bin / gs_clut_tbp_<tbp0>.bin)
++        static const char *s_dumpTbpEnv = std::getenv("PS2X_GS_DUMP_TBP");
++        static std::vector<uint32_t> s_dumpTbpDone;
++        // PS2X_GS_DUMP_TYPE=<prim type> restringe o dump a um tipo de primitiva (ex.: 4 = tristrip)
++        static const char *s_dumpTypeEnv = std::getenv("PS2X_GS_DUMP_TYPE");
++        if (s_dumpTbpEnv && state.prim.tme != 0u &&
++            (!s_dumpTypeEnv || static_cast<int>(state.prim.type) == std::atoi(s_dumpTypeEnv)))
++        {
++            const std::string list = std::string(",") + s_dumpTbpEnv + ",";
++            const uint32_t tbp = ctx.tex0.tbp0;
++            const bool wanted = list.find("," + std::to_string(tbp) + ",") != std::string::npos;
++            if (wanted && std::find(s_dumpTbpDone.begin(), s_dumpTbpDone.end(), tbp) == s_dumpTbpDone.end())
++            {
++                s_dumpTbpDone.push_back(tbp);
++                const std::string suffix = std::to_string(tbp) + ".bin";
++                if (std::FILE *dump = std::fopen(("gs_vram_tbp_" + suffix).c_str(), "wb"))
++                {
++                    std::fwrite(m_vram, 1u, m_vramSize, dump);
++                    std::fclose(dump);
++                }
++                ps2_gs_stats::dumpEeRam(("ee_ram_tbp_" + suffix).c_str());
++                ps2_gs_stats::dumpEeScratchpad(("ee_spr_tbp_" + suffix).c_str());
++                if (std::FILE *dump = std::fopen(("gs_clut_tbp_" + suffix).c_str(), "wb"))
++                {
++                    std::fwrite(m_clut.data(), sizeof(m_clut[0]), m_clut.size(), dump);
++                    std::fclose(dump);
++                }
++                std::fprintf(stderr, "[gs:trace] VRAM/CLUT gravadas na tbp0=%u texa=(ta0=0x%x aem=%d ta1=0x%x)\n",
++                             static_cast<unsigned>(tbp), static_cast<unsigned>(state.texa.ta0),
++                             state.texa.aem ? 1 : 0, static_cast<unsigned>(state.texa.ta1));
++            }
++        }
++        const auto &v = batch.vertices;
++        std::fprintf(stderr,
++                     "[gs:trace] type=%u tme=%u abe=%u fst=%u ctxt=%u fbp=%u fbw=%u fpsm=0x%x fbmsk=0x%x "
++                     "tbp0=%u tbw=%u tpsm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=%u cpsm=0x%x csm=%u csa=%u "
++                     "clamp=0x%llx test=0x%llx alpha=0x%llx "
++                     "v0=(%d,%d,%u) uv0=(%d,%d) st0=(%g,%g,%g) c0=(%u,%u,%u,%u) "
++                     "v1=(%d,%d) uv1=(%d,%d) st1=(%g,%g,%g) v2=(%d,%d) uv2=(%d,%d)\n",
++                     static_cast<unsigned>(state.prim.type), static_cast<unsigned>(state.prim.tme),
++                     static_cast<unsigned>(state.prim.abe), static_cast<unsigned>(state.prim.fst),
++                     static_cast<unsigned>(state.prim.ctxt), static_cast<unsigned>(ctx.frame.fbp),
++                     static_cast<unsigned>(ctx.frame.fbw), static_cast<unsigned>(ctx.frame.psm),
++                     static_cast<unsigned>(ctx.frame.fbmsk),
++                     static_cast<unsigned>(ctx.tex0.tbp0), static_cast<unsigned>(ctx.tex0.tbw),
++                     static_cast<unsigned>(ctx.tex0.psm), static_cast<unsigned>(ctx.tex0.tw),
++                     static_cast<unsigned>(ctx.tex0.th), static_cast<unsigned>(ctx.tex0.tcc),
++                     static_cast<unsigned>(ctx.tex0.tfx), static_cast<unsigned>(ctx.tex0.cbp),
++                     static_cast<unsigned>(ctx.tex0.cpsm), static_cast<unsigned>(ctx.tex0.csm),
++                     static_cast<unsigned>(ctx.tex0.csa),
++                     static_cast<unsigned long long>(ctx.clamp), static_cast<unsigned long long>(ctx.test),
++                     static_cast<unsigned long long>(ctx.alpha),
++                     static_cast<int>(v[0].x), static_cast<int>(v[0].y), static_cast<unsigned>(v[0].z),
++                     static_cast<int>(v[0].u >> 4), static_cast<int>(v[0].v >> 4),
++                     static_cast<double>(v[0].s), static_cast<double>(v[0].t), static_cast<double>(v[0].q),
++                     static_cast<unsigned>(v[0].r), static_cast<unsigned>(v[0].g), static_cast<unsigned>(v[0].b),
++                     static_cast<unsigned>(v[0].a),
++                     static_cast<int>(v[1].x), static_cast<int>(v[1].y),
++                     static_cast<int>(v[1].u >> 4), static_cast<int>(v[1].v >> 4),
++                     static_cast<double>(v[1].s), static_cast<double>(v[1].t), static_cast<double>(v[1].q),
++                     static_cast<int>(v[2].x), static_cast<int>(v[2].y),
++                     static_cast<int>(v[2].u >> 4), static_cast<int>(v[2].v >> 4));
++    }
+     PS2_IF_AGRESSIVE_LOGS({
+         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
+         if (primitiveIndex < 64u)
+@@ -1470,6 +1541,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+     m_transferState.copiedPixels = 0u;
+     m_transferState.direction = command.direction;
+     m_transferState.localToHostPendingBytes = 0u;
++    if (ps2_gs_stats::primTraceActive())
++    {
++        std::fprintf(stderr,
++                     "[gs:xfer] dir=%u sbp=%u sbw=%u spsm=0x%x dbp=%u dbw=%u dpsm=0x%x src=(%u,%u) dst=(%u,%u) size=%ux%u\n",
++                     static_cast<unsigned>(command.direction), static_cast<unsigned>(command.bitbltbuf.sbp),
++                     static_cast<unsigned>(command.bitbltbuf.sbw), static_cast<unsigned>(command.bitbltbuf.spsm),
++                     static_cast<unsigned>(command.bitbltbuf.dbp), static_cast<unsigned>(command.bitbltbuf.dbw),
++                     static_cast<unsigned>(command.bitbltbuf.dpsm), static_cast<unsigned>(command.trxpos.ssax),
++                     static_cast<unsigned>(command.trxpos.ssay), static_cast<unsigned>(command.trxpos.dsax),
++                     static_cast<unsigned>(command.trxpos.dsay), static_cast<unsigned>(command.trxreg.rrw),
++                     static_cast<unsigned>(command.trxreg.rrh));
++    }
+ 
+     if (command.direction == 2u)
+         PerformLocalToLocalTransfer();
+@@ -1480,6 +1563,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
++    if (data && sizeBytes <= 256u && ps2_gs_stats::primTraceActive())
++    {
++        std::string hex;
++        char byteText[3];
++        for (uint32_t i = 0u; i < sizeBytes; ++i)
++        {
++            std::snprintf(byteText, sizeof(byteText), "%02x", data[i]);
++            hex += byteText;
++        }
++        std::fprintf(stderr, "[gs:xfer-data] dbp=%u bytes=%u %s\n",
++                     static_cast<unsigned>(m_transfer.bitbltbuf.dbp), static_cast<unsigned>(sizeBytes), hex.c_str());
++    }
+     if (!data || sizeBytes == 0u || !m_vram || m_transferState.direction != 0u)
+         return;
+     if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 5658928..5cd15e4 100644
+index 5658928..4c35b2f 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -2,6 +2,9 @@
+@@ -1,7 +1,11 @@
++#include <cstdlib>
+ #include "runtime/gs/gs_frontend.h"
  #include "runtime/gs/gs_cpu_backend.h"
  #include "ps2_log.h"
  #include "runtime/ps2_memory.h"
@@ -998,7 +1984,7 @@ index 5658928..5cd15e4 100644
  #include <atomic>
  #include <algorithm>
  #include <cmath>
-@@ -408,8 +411,51 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
+@@ -408,8 +412,130 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
      recordDebugEventUnlocked(entry);
  }
  
@@ -1007,10 +1993,86 @@ index 5658928..5cd15e4 100644
 +    std::mutex g_drawStatsMutex;
 +    std::map<uint64_t, uint64_t> g_drawStats; // (fbp << 40) | (psm << 32) | fbmsk -> draws
 +    std::map<std::string, uint64_t> g_eventStats;
++    std::atomic<int> g_primTraceBudget{0};
++}
++
++void ps2_gs_stats::requestPrimTrace(int count)
++{
++    g_primTraceBudget.store(count, std::memory_order_relaxed);
++}
++
++bool ps2_gs_stats::primTraceActive()
++{
++    return g_primTraceBudget.load(std::memory_order_relaxed) > 0;
++}
++
++bool ps2_gs_stats::takePrimTraceSlot()
++{
++    int current = g_primTraceBudget.load(std::memory_order_relaxed);
++    while (current > 0)
++    {
++        if (g_primTraceBudget.compare_exchange_weak(current, current - 1, std::memory_order_relaxed))
++            return true;
++    }
++    return false;
++}
++
++namespace
++{
++    const unsigned char *g_eeRamForDump = nullptr;
++    unsigned int g_eeRamForDumpSize = 0u;
++}
++
++void ps2_gs_stats::setEeRam(const unsigned char *ram, unsigned int size)
++{
++    g_eeRamForDump = ram;
++    g_eeRamForDumpSize = size;
++}
++
++void ps2_gs_stats::dumpEeRam(const char *path)
++{
++    if (!g_eeRamForDump || g_eeRamForDumpSize == 0u)
++        return;
++    if (std::FILE *dump = std::fopen(path, "wb"))
++    {
++        std::fwrite(g_eeRamForDump, 1u, g_eeRamForDumpSize, dump);
++        std::fclose(dump);
++    }
++}
++
++namespace
++{
++    const unsigned char *g_eeSprForDump = nullptr;
++    unsigned int g_eeSprForDumpSize = 0u;
++}
++
++void ps2_gs_stats::setEeScratchpad(const unsigned char *spr, unsigned int size)
++{
++    g_eeSprForDump = spr;
++    g_eeSprForDumpSize = size;
++}
++
++void ps2_gs_stats::dumpEeScratchpad(const char *path)
++{
++    if (!g_eeSprForDump || g_eeSprForDumpSize == 0u)
++        return;
++    if (std::FILE *dump = std::fopen(path, "wb"))
++    {
++        std::fwrite(g_eeSprForDump, 1u, g_eeSprForDumpSize, dump);
++        std::fclose(dump);
++    }
++}
++
++bool ps2_gs_stats::statsEnabled()
++{
++    static const bool enabled = std::getenv("PS2X_STATS") != nullptr;
++    return enabled;
 +}
 +
 +void ps2_gs_stats::countEvent(const char *name)
 +{
++    if (!statsEnabled() && std::strcmp(name, "gs.finish_irq") != 0)
++        return;
 +    std::lock_guard<std::mutex> lock(g_drawStatsMutex);
 +    ++g_eventStats[name];
 +}
@@ -1042,14 +2104,29 @@ index 5658928..5cd15e4 100644
  {
 +    if (vertexCount > 0)
 +    {
-+        const GSFrameReg &frame = m_ctx[m_prim.ctxt ? 1 : 0].frame;
-+        const uint64_t key = (static_cast<uint64_t>(frame.fbp) << 40) | (static_cast<uint64_t>(frame.psm) << 32) | frame.fbmsk;
-+        std::lock_guard<std::mutex> lock(g_drawStatsMutex);
-+        ++g_drawStats[key];
++        if (ps2_gs_stats::statsEnabled())
++        {
++            const GSFrameReg &frame = m_ctx[m_prim.ctxt ? 1 : 0].frame;
++            const uint64_t key = (static_cast<uint64_t>(frame.fbp) << 40) | (static_cast<uint64_t>(frame.psm) << 32) | frame.fbmsk;
++            std::lock_guard<std::mutex> lock(g_drawStatsMutex);
++            ++g_drawStats[key];
++        }
 +    }
      if (m_debugHistoryPaused)
      {
          return;
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..e49b68c 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -470,6 +470,7 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
+ 
+     // EE n32 ABI: the fifth argument travels in $t0, matching the sceMc* stubs.
+     setRegU32(&context, 8, request.arguments[4]);
++    setRegU32(&context, 9, request.arguments[5]);
+ 
+     handler(m_activeRdram ? m_activeRdram : m_runtime.memory().getRDRAM(),
+             &context,
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
 index 37b6a4d..92318ad 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
@@ -1337,7 +2414,7 @@ index 37b6a4d..92318ad 100644
  {
      static constexpr uint32_t kDStat = 0x1000E010u;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..d029ea1 100644
+index 45cb9d2..ed0eb91 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,4 @@
@@ -1354,7 +2431,79 @@ index 45cb9d2..d029ea1 100644
  #include <cstring>
  #include <limits>
  #include <chrono>
-@@ -732,7 +735,20 @@ bool PS2Runtime::initialize(const char *title)
+@@ -37,6 +40,62 @@ namespace ps2_stubs
+ #define EM_MIPS 8            // MIPS architecture
+ #define PT_LOAD 1            // Loadable segment
+ 
++// Vigia de escrita (ps2_runtime.h): PS2X_WRITE_WATCH=0xADDR[:bytes] (padrao 4 bytes). Registra cada
++// store que toca a faixa com o PC exato e o $ra; limites em PS2X_WRITE_WATCH_MAX (padrao 16 por PC, 4000 no total).
++namespace
++{
++    struct GuestWriteWatchInit
++    {
++        GuestWriteWatchInit()
++        {
++            const char *env = std::getenv("PS2X_WRITE_WATCH");
++            if (!env || !*env)
++                return;
++            char *end = nullptr;
++            const uint32_t addr = static_cast<uint32_t>(std::strtoul(env, &end, 16)) & PS2_RAM_MASK;
++            uint32_t bytes = 4u;
++            if (end && *end == ':')
++                bytes = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0));
++            g_ps2WriteWatchLo = addr;
++            g_ps2WriteWatchHi = addr + (bytes ? bytes : 4u);
++            std::fprintf(stderr, "[write-watch] 0x%08x..0x%08x\n", g_ps2WriteWatchLo, g_ps2WriteWatchHi);
++        }
++    } g_guestWriteWatchInit;
++}
++
++void ps2ReportGuestWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const char *op,
++                         const R5900Context *ctx)
++{
++    static std::mutex s_mutex;
++    static std::unordered_map<uint32_t, uint32_t> s_perPc;
++    static uint32_t s_total = 0u;
++    std::lock_guard<std::mutex> lock(s_mutex);
++    // PS2X_WRITE_WATCH_MAX=<por PC>[:<total>] (padrao 16:4000)
++    static const std::pair<uint32_t, uint32_t> s_limits = []()
++    {
++        uint32_t perPc = 16u, total = 4000u;
++        if (const char *env = std::getenv("PS2X_WRITE_WATCH_MAX"))
++        {
++            char *end = nullptr;
++            perPc = static_cast<uint32_t>(std::strtoul(env, &end, 0));
++            if (end && *end == ':')
++                total = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 0));
++        }
++        return std::make_pair(perPc, total);
++    }();
++    const uint32_t pc = ctx ? ctx->pc : 0u;
++    if (s_total >= s_limits.second || s_perPc[pc]++ >= s_limits.first)
++        return;
++    ++s_total;
++    const uint32_t ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
++    float asFloat = 0.0f;
++    const uint32_t low32 = static_cast<uint32_t>(valueLo);
++    std::memcpy(&asFloat, &low32, sizeof(asFloat));
++    std::fprintf(stderr, "[write-watch] pc=0x%06x ra=0x%06x %s addr=0x%08x size=%u lo=0x%016llx hi=0x%016llx (f=%g)\n", pc,
++                 ra, op, guestAddr, size, static_cast<unsigned long long>(valueLo),
++                 static_cast<unsigned long long>(valueHi), asFloat);
++}
++
+ static constexpr int FB_WIDTH = 640;
+ static constexpr int FB_HEIGHT = 512;
+ static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
+@@ -665,6 +724,8 @@ bool PS2Runtime::syncCoreSubsystems()
+     }
+ 
+     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
++    ps2_gs_stats::setEeRam(rdram, PS2_RAM_SIZE);
++    ps2_gs_stats::setEeScratchpad(m_memory.getScratchpad(), 16u * 1024u);
+     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
+                                     { m_gs.processGIFPacket(data, size); });
+     m_memory.setGifArbiter(&m_gifArbiter);
+@@ -732,7 +793,20 @@ bool PS2Runtime::initialize(const char *title)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
          SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -1376,7 +2525,71 @@ index 45cb9d2..d029ea1 100644
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
  #endif
-@@ -2410,6 +2426,9 @@ void PS2Runtime::run()
+@@ -2388,6 +2462,63 @@ void PS2Runtime::run()
+     uint64_t tick = 0;
+     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+     {
++        {
++            static uint64_t s_watchTick = 0u;
++            ++s_watchTick;
++            {
++                // Debug: PS2X_WATCH_U32=0xADDR[,0xADDR...] registra cada mudanca dessas palavras da RAM do
++                // EE (verificado a cada quadro do host), com o texto apontado quando parece um ponteiro.
++                static std::vector<std::pair<uint32_t, uint32_t>> s_watch = []()
++                {
++                    std::vector<std::pair<uint32_t, uint32_t>> list;
++                    if (const char *env = std::getenv("PS2X_WATCH_U32"))
++                    {
++                        std::string text(env);
++                        size_t start = 0u;
++                        while (start < text.size())
++                        {
++                            const size_t end = text.find(',', start);
++                            const std::string item = text.substr(start, end == std::string::npos ? std::string::npos : end - start);
++                            if (!item.empty())
++                                list.push_back({static_cast<uint32_t>(std::strtoul(item.c_str(), nullptr, 16)) & ~3u, 0xFFFFFFFFu});
++                            if (end == std::string::npos)
++                                break;
++                            start = end + 1u;
++                        }
++                    }
++                    return list;
++                }();
++                const uint8_t *ram = m_memory.getRDRAM();
++                for (auto &entry : s_watch)
++                {
++                    if (!ram || entry.first + 4u > PS2_RAM_SIZE)
++                        continue;
++                    uint32_t value = 0u;
++                    std::memcpy(&value, ram + entry.first, sizeof(value));
++                    if (value == entry.second)
++                        continue;
++                    entry.second = value;
++                    char text[33] = {};
++                    uint32_t textAddr = value & PS2_RAM_MASK;
++                    if (value >= 0x100000u && value < PS2_RAM_SIZE)
++                    {
++                        uint32_t nameAddr = 0u; // ponteiro para estrutura cujo 1o campo aponta texto
++                        std::memcpy(&nameAddr, ram + textAddr, sizeof(nameAddr));
++                        if (nameAddr >= 0x100000u && nameAddr < PS2_RAM_SIZE - 32u && ram[nameAddr] >= 'A' && ram[nameAddr] <= 'z')
++                            textAddr = nameAddr;
++                        for (uint32_t i = 0u; i < 32u && textAddr + i < PS2_RAM_SIZE; ++i)
++                        {
++                            const char c = static_cast<char>(ram[textAddr + i]);
++                            if (c < 32 || c > 126)
++                                break;
++                            text[i] = c;
++                        }
++                    }
++                    std::fprintf(stderr, "[watch] tick=%llu 0x%08x = 0x%08x %s\n", static_cast<unsigned long long>(s_watchTick),
++                                 entry.first, value, text);
++                }
++            }
++        }
+         PS2_IF_AGRESSIVE_LOGS({
+             tick++;
+             if ((tick % 120) == 0)
+@@ -2410,6 +2541,9 @@ void PS2Runtime::run()
                                                 << " gp=0x" << dbgGp
                                                 << " dispfb1=0x" << gs.dispfb1
                                                 << " display1=0x" << gs.display1
@@ -1386,7 +2599,7 @@ index 45cb9d2..d029ea1 100644
                                                 << std::dec
                                                 << " activeThreads=" << eeSnapshot.threads.size()
                                                 << " dma=" << curDma
-@@ -2417,6 +2436,49 @@ void PS2Runtime::run()
+@@ -2417,6 +2551,49 @@ void PS2Runtime::run()
                                                 << " gsw=" << curGs
                                                 << " vif=" << curVif
                                                 << std::endl);
@@ -1436,6 +2649,44 @@ index 45cb9d2..d029ea1 100644
  
              }
          });
+@@ -2424,6 +2601,37 @@ void PS2Runtime::run()
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
++        if (IsKeyPressed(KEY_F9))
++        {
++            // Debug: registra as proximas primitivas do GS ([gs:trace]).
++            std::fprintf(stderr, "[gs:trace] ---- F9: inicio do rastreio ----\n");
++            ps2_gs_stats::requestPrimTrace(30000);
++            // e grava a VRAM do GS (4 MB, layout bruto em blocos) para decodificar texturas offline
++            if (const uint8_t *vram = m_memory.getGSVRAM())
++            {
++                if (std::FILE *dump = std::fopen("gs_vram_f9.bin", "wb"))
++                {
++                    std::fwrite(vram, 1u, PS2_GS_VRAM_SIZE, dump);
++                    std::fclose(dump);
++                }
++            }
++            if (const uint8_t *ram = m_memory.getRDRAM())
++            {
++                if (std::FILE *dump = std::fopen("ee_ram_f9.bin", "wb"))
++                {
++                    std::fwrite(ram, 1u, PS2_RAM_SIZE, dump);
++                    std::fclose(dump);
++                }
++            }
++            if (const uint8_t *spr = m_memory.getScratchpad())
++            {
++                if (std::FILE *dump = std::fopen("ee_spr_f9.bin", "wb"))
++                {
++                    std::fwrite(spr, 1u, 16u * 1024u, dump);
++                    std::fclose(dump);
++                }
++            }
++        }
+         BeginDrawing();
+         ClearBackground(BLACK);
+         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 index b02c7ca..72fdaed 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
@@ -1674,15 +2925,91 @@ index b02c7ca..72fdaed 100644
 +    carryFrom(pos);
  }
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..93b149b 100644
+index bd75bba..988d0ed 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-@@ -1,3 +1,4 @@
+@@ -1,8 +1,10 @@
 +#include "runtime/gs/gs_draw_stats.h"
  #include "runtime/ps2_vu1.h"
  #include "runtime/gs/ps2_gif_arbiter.h"
  #include "runtime/gs/gs_frontend.h"
-@@ -919,6 +920,7 @@ void VU1Interpreter::finishXgkick()
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
++#include "ps2_vu1_fast.h"
+ 
+ #include <algorithm>
+ #include <cfenv>
+@@ -73,7 +75,16 @@ void VU1Interpreter::resetScheduler()
+     m_vfWritePipeline = {};
+     m_viWritePipeline = {};
+     m_accWritePipeline = {};
+-    m_xgkick = {};
++    // Zera so o estado de controle do PATH1; o buffer de 64 KB (packet) e sobrescrito antes de ser lido.
++    // Antes `m_xgkick = {}` fazia memset de 64 KB a cada microprograma e a cada XGKICK (FUNCOES.md #45).
++    m_xgkick.sourceAddress = 0u;
++    m_xgkick.totalBytes = 0u;
++    m_xgkick.copiedBytes = 0u;
++    m_xgkick.currentTagEnd = 0u;
++    m_xgkick.cycleCredit = 0u;
++    m_xgkick.issueCycle = 0u;
++    m_xgkick.active = false;
++    m_xgkick.currentTagEop = false;
+     m_vfReady = {};
+     m_viReady = {};
+     m_accReady = {};
+@@ -103,7 +114,7 @@ void VU1Interpreter::reset()
+ 
+ float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
+ {
+-    return normalizeOperand(vf[bc & 3u]);
++    return vuNormalizeOperandFast(vf[bc & 3u]);
+ }
+ 
+ float VU1Interpreter::normalizeOperand(float value) const
+@@ -229,7 +240,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+ 
+     const auto operand = [this](float value)
+     {
+-        return static_cast<long double>(normalizeOperand(value));
++        return static_cast<long double>(vuNormalizeOperandFast(value));
+     };
+     const auto vs = [&](uint32_t lane)
+     {
+@@ -454,27 +465,27 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+         static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
+         static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
+         const uint8_t leftComponent = op == 0x2Eu ? crossLeft[component] : static_cast<uint8_t>(component);
+-        const float left = normalizeOperand(m_state.vf[fs][leftComponent]);
++        const float left = vuNormalizeOperandFast(m_state.vf[fs][leftComponent]);
+         float right = 0.0f;
+         if ((op >= 0x08u && op <= 0x0Fu) || (special >= 0x08u && special <= 0x0Fu))
+         {
+-            right = normalizeOperand(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
++            right = vuNormalizeOperandFast(m_state.vf[ft][(op >= 0x08u && op <= 0x0Fu ? op : special) & 3u]);
+         }
+         else if (op == 0x21u || op == 0x25u || special == 0x21u || special == 0x25u)
+         {
+-            right = normalizeOperand(m_state.q);
++            right = vuNormalizeOperandFast(m_state.q);
+         }
+         else if (op == 0x23u || op == 0x27u || special == 0x23u || special == 0x27u)
+         {
+-            right = normalizeOperand(m_state.i);
++            right = vuNormalizeOperandFast(m_state.i);
+         }
+         else if (op == 0x2Eu)
+         {
+-            right = normalizeOperand(m_state.vf[ft][crossRight[component]]);
++            right = vuNormalizeOperandFast(m_state.vf[ft][crossRight[component]]);
+         }
+         else
+         {
+-            right = normalizeOperand(m_state.vf[ft][component]);
++            right = vuNormalizeOperandFast(m_state.vf[ft][component]);
+         }
+ 
+         float product = left * right;
+@@ -919,6 +930,7 @@ void VU1Interpreter::finishXgkick()
      if (!m_xgkick.active)
          return;
  
@@ -1690,19 +3017,31 @@ index bd75bba..93b149b 100644
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
-@@ -931,6 +933,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+@@ -931,8 +943,18 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
      if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
          return;
  
 +    ps2_gs_stats::countEvent("vu1.xgkick.start");
      const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-     m_xgkick = {};
+-    m_xgkick = {};
++    // Zera so o estado de controle do PATH1; o buffer de 64 KB (packet) e sobrescrito antes de ser lido.
++    // Antes `m_xgkick = {}` fazia memset de 64 KB a cada microprograma e a cada XGKICK (FUNCOES.md #45).
++    m_xgkick.sourceAddress = 0u;
++    m_xgkick.totalBytes = 0u;
++    m_xgkick.copiedBytes = 0u;
++    m_xgkick.currentTagEnd = 0u;
++    m_xgkick.cycleCredit = 0u;
++    m_xgkick.issueCycle = 0u;
++    m_xgkick.active = false;
++    m_xgkick.currentTagEop = false;
      m_xgkick.active = true;
-@@ -1591,6 +1594,12 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     m_xgkick.sourceAddress = sourceAddress;
+     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
+@@ -1591,6 +1613,12 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t maxCycles)
  {
      resetScheduler();
-+    if (m_unit == Unit::VU1)
++    if (m_unit == Unit::VU1 && ps2_gs_stats::statsEnabled())
 +    {
 +        char name[32];
 +        std::snprintf(name, sizeof(name), "vu1.pc=0x%x", static_cast<unsigned>(startPC & microAddressMask()));
@@ -1711,7 +3050,7 @@ index bd75bba..93b149b 100644
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
      m_state.haltAfterDelaySlot = false;
-@@ -1632,7 +1641,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1632,7 +1660,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const int previousRoundingMode = std::fegetround();
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
@@ -1736,7 +3075,7 @@ index bd75bba..93b149b 100644
      while (m_cycle < budgetEnd && !m_stopRequested)
      {
          commitReadyPipelines();
-@@ -1640,6 +1666,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1640,6 +1685,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              break;
  
          const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
@@ -1749,11 +3088,20 @@ index bd75bba..93b149b 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1824,6 +1856,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1695,7 +1746,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+             execUpper(decoded.upper);
+             float immediate = 0.0f;
+             std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
+-            m_state.i = normalizeOperand(immediate);
++            m_state.i = vuNormalizeOperandFast(immediate);
+         }
+         else if (decoded.upperVfShadowReg != 0u)
+         {
+@@ -1824,6 +1875,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              break;
      }
  
-+    if (m_unit == Unit::VU1)
++    if (m_unit == Unit::VU1 && ps2_gs_stats::statsEnabled())
 +    {
 +        ps2_gs_stats::countEvent(programEnded ? "vu1.end.ebit" : (m_cycle >= budgetEnd ? "vu1.end.budget" : "vu1.end.other"));
 +        const uint64_t ran = m_cycle - runStartCycle;
@@ -1762,11 +3110,42 @@ index bd75bba..93b149b 100644
      if (programEnded)
      {
          flushPipelines();
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h
+new file mode 100644
+index 0000000..c84302d
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_fast.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <cstdint>
++#include <cstring>
++
++// Desempenho (FUNCOES.md #45): versao inline de VU1Interpreter::normalizeOperand, chamada para cada
++// operando de cada instrucao FMAC. O metodo fica fora de linha em outro arquivo e o compilador nao o
++// embutia. Mesma logica: denormal -> zero com sinal, Inf/NaN -> +-FLT_MAX.
++static inline float vuNormalizeOperandFast(float value)
++{
++    uint32_t bits;
++    std::memcpy(&bits, &value, sizeof(bits));
++    const uint32_t exponent = bits & 0x7F800000u;
++    if (exponent == 0u)
++        bits &= 0x80000000u;
++    else if (exponent == 0x7F800000u)
++        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
++    std::memcpy(&value, &bits, sizeof(value));
++    return value;
++}
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
-index 94be789..345baaf 100644
+index 94be789..f814729 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_lower.cpp
-@@ -7,6 +7,11 @@
+@@ -3,10 +3,18 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/ps2_memory.h"
+ #include "ps2_vu1_detail.h"
++#include "ps2_vu1_fast.h"
+ 
  #include <cmath>
  #include <cstring>
  #include <limits>
@@ -1774,11 +3153,13 @@ index 94be789..345baaf 100644
 +// Experiment (FUNCOES.md #25): JR/JALR read the current VI value (set PS2X_VU1_JR_VI_DELAY to restore the
 +// conditional-branch VI delay for them). Red Dead Revolver's VU1 code does `IADDIU vi15, vi0, kick;
 +// JR vi15` to reach its XGKICK routine; with the delay it returned to the old vi15 and never kicked.
-+#define jumpViValue(reg)     (std::getenv("PS2X_VU1_JR_VI_DELAY") != nullptr ? readBranchVi(reg) : ((reg) == 0u ? 0 : m_state.vi[(reg)]))
++// getenv uma unica vez (antes era chamado a cada JR/JALR; FUNCOES.md #45)
++static const bool s_jrViDelay = std::getenv("PS2X_VU1_JR_VI_DELAY") != nullptr;
++#define jumpViValue(reg)     (s_jrViDelay ? readBranchVi(reg) : ((reg) == 0u ? 0 : m_state.vi[(reg)]))
  
  namespace
  {
-@@ -284,7 +289,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+@@ -284,7 +292,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
      case 0x24: // JR
      {
          uint8_t is = VIS(instr);
@@ -1787,7 +3168,7 @@ index 94be789..345baaf 100644
          m_state.branchPending = true;
          m_state.branchTarget = target;
          m_state.branchDelay = 1;
-@@ -294,7 +299,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+@@ -294,7 +302,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
      {
          uint8_t it = VIT(instr);
          uint8_t is = VIS(instr);
@@ -1796,3 +3177,202 @@ index 94be789..345baaf 100644
          if (it != 0)
              m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
          m_state.branchPending = true;
+@@ -500,8 +508,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             {
+                 int fsf = (instr >> 21) & 0x3;
+                 int ftf = (instr >> 23) & 0x3;
+-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+-                const float den = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float num = vuNormalizeOperandFast(m_state.vf[vfS][fsf]);
++                const float den = vuNormalizeOperandFast(m_state.vf[vfT][ftf]);
+                 uint32_t statusDi = 0u;
+                 float result = 0.0f;
+                 if (den == 0.0f)
+@@ -523,7 +531,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             case 0x39: // SQRT
+             {
+                 int ftf = (instr >> 23) & 0x3;
+-                const float val = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float val = vuNormalizeOperandFast(m_state.vf[vfT][ftf]);
+                 queueQ(std::sqrt(std::fabs(val)), 7u,
+                        val < 0.0f ? 0x10u : 0u);
+                 return;
+@@ -532,8 +540,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             {
+                 int fsf = (instr >> 21) & 0x3;
+                 int ftf = (instr >> 23) & 0x3;
+-                const float num = normalizeOperand(m_state.vf[vfS][fsf]);
+-                const float radicand = normalizeOperand(m_state.vf[vfT][ftf]);
++                const float num = vuNormalizeOperandFast(m_state.vf[vfS][fsf]);
++                const float radicand = vuNormalizeOperandFast(m_state.vf[vfT][ftf]);
+                 const float den = std::sqrt(std::fabs(radicand));
+                 uint32_t statusDi = radicand < 0.0f ? 0x10u : 0u;
+                 float result = 0.0f;
+@@ -669,49 +677,49 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+                 return;
+             case 0x70: // ESADD
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormalizeOperandFast(m_state.vf[vfS][0]);
++                const float y = vuNormalizeOperandFast(m_state.vf[vfS][1]);
++                const float z = vuNormalizeOperandFast(m_state.vf[vfS][2]);
+                 queueP(x * x + y * y + z * z, 11u);
+                 return;
+             }
+             case 0x71: // ERSADD
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormalizeOperandFast(m_state.vf[vfS][0]);
++                const float y = vuNormalizeOperandFast(m_state.vf[vfS][1]);
++                const float z = vuNormalizeOperandFast(m_state.vf[vfS][2]);
+                 const float sum = x * x + y * y + z * z;
+                 queueP(sum != 0.0f ? 1.0f / sum : sum, 18u);
+                 return;
+             }
+             case 0x72: // ELENG
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormalizeOperandFast(m_state.vf[vfS][0]);
++                const float y = vuNormalizeOperandFast(m_state.vf[vfS][1]);
++                const float z = vuNormalizeOperandFast(m_state.vf[vfS][2]);
+                 queueP(std::sqrt(x * x + y * y + z * z), 18u);
+                 return;
+             }
+             case 0x73: // ERLENG
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormalizeOperandFast(m_state.vf[vfS][0]);
++                const float y = vuNormalizeOperandFast(m_state.vf[vfS][1]);
++                const float z = vuNormalizeOperandFast(m_state.vf[vfS][2]);
+                 const float len = std::sqrt(x * x + y * y + z * z);
+                 queueP(len != 0.0f ? 1.0f / len : len, 24u);
+                 return;
+             }
+             case 0x74: // EATANxy
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float y = normalizeOperand(m_state.vf[vfS][1]);
++                const float x = vuNormalizeOperandFast(m_state.vf[vfS][0]);
++                const float y = vuNormalizeOperandFast(m_state.vf[vfS][1]);
+                 queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
+                 return;
+             }
+             case 0x75: // EATANxz
+             {
+-                const float x = normalizeOperand(m_state.vf[vfS][0]);
+-                const float z = normalizeOperand(m_state.vf[vfS][2]);
++                const float x = vuNormalizeOperandFast(m_state.vf[vfS][0]);
++                const float z = vuNormalizeOperandFast(m_state.vf[vfS][2]);
+                 queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
+                 return;
+             }
+@@ -719,14 +727,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             {
+                 float sum = 0.0f;
+                 for (uint32_t component = 0; component < 4u; ++component)
+-                    sum += normalizeOperand(m_state.vf[vfS][component]);
++                    sum += vuNormalizeOperandFast(m_state.vf[vfS][component]);
+                 queueP(sum, 12u);
+                 return;
+             }
+             case 0x77: // ERSQRT
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormalizeOperandFast(m_state.vf[vfS][component]);
+                 float result = value;
+                 if (result >= 0.0f)
+                 {
+@@ -740,21 +748,21 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             case 0x78: // ESQRT
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormalizeOperandFast(m_state.vf[vfS][component]);
+                 queueP(value >= 0.0f ? std::sqrt(value) : value, 12u);
+                 return;
+             }
+             case 0x79: // ESIN
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormalizeOperandFast(m_state.vf[vfS][component]);
+                 queueP(vuEsin(value), 29u);
+                 return;
+             }
+             case 0x7A: // ERCPR
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                const float value = normalizeOperand(m_state.vf[vfS][component]);
++                const float value = vuNormalizeOperandFast(m_state.vf[vfS][component]);
+                 queueP(value != 0.0f ? 1.0f / value : value, 12u);
+                 return;
+             }
+@@ -763,13 +771,13 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
+             case 0x7C: // EATAN
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
++                queueP(vuEatan(vuNormalizeOperandFast(m_state.vf[vfS][component])), 54u);
+                 return;
+             }
+             case 0x7D: // EEXP
+             {
+                 const uint32_t component = (instr >> 21) & 3u;
+-                queueP(vuEexp(normalizeOperand(m_state.vf[vfS][component])), 44u);
++                queueP(vuEexp(vuNormalizeOperandFast(m_state.vf[vfS][component])), 44u);
+                 return;
+             }
+             default:
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+index 6974254..bc4dbe7 100644
+--- a/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_upper.cpp
+@@ -1,5 +1,7 @@
++#include <cstdlib>
+ #include "runtime/ps2_vu1.h"
+ #include "ps2_vu1_detail.h"
++#include "ps2_vu1_fast.h"
+ 
+ #include <cmath>
+ #include <cstring>
+@@ -36,15 +38,15 @@ void VU1Interpreter::execUpper(uint32_t instr)
+     float normalizedAcc[4];
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+-        normalizedVs[component] = normalizeOperand(m_state.vf[fs][component]);
+-        normalizedVt[component] = normalizeOperand(m_state.vf[ft][component]);
+-        normalizedAcc[component] = normalizeOperand(m_state.acc[component]);
++        normalizedVs[component] = vuNormalizeOperandFast(m_state.vf[fs][component]);
++        normalizedVt[component] = vuNormalizeOperandFast(m_state.vf[ft][component]);
++        normalizedAcc[component] = vuNormalizeOperandFast(m_state.acc[component]);
+     }
+     const float *vs = normalizedVs;
+     const float *vt = normalizedVt;
+     const float *acc = normalizedAcc;
+-    const float q = normalizeOperand(m_state.q);
+-    const float i = normalizeOperand(m_state.i);
++    const float q = vuNormalizeOperandFast(m_state.q);
++    const float i = vuNormalizeOperandFast(m_state.i);
+     float result[4];
+ 
+     // Upper opcode decoding (bits 5:0 of upper word)
+@@ -411,6 +413,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
+                 flags |= 0x10u;
+             if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
+                 flags |= 0x20u;
++            // Experimento: PS2X_VU1_CLIP_ZERO=1 faz o CLIP nunca reportar vertice fora do volume.
++            static const bool s_clipZero = std::getenv("PS2X_VU1_CLIP_ZERO") != nullptr;
++            if (s_clipZero)
++                flags = 0u;
+             queueClip(flags);
+             return;
+         }

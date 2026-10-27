@@ -466,20 +466,21 @@ index 2c8d8f7..c20c111 100644
              return true;
          }
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index e5f63a9..5ba1a77 100644
+index e5f63a9..47731c9 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -18,6 +18,9 @@
+@@ -18,6 +18,10 @@
  #include "iop_emulator_const.h"
  
  #include <algorithm>
++#include <iterator>
 +#include <vector>
 +#include <cstdlib>
 +#include <cstdio>
  #include <cctype>
  #include <map>
  #include <optional>
-@@ -105,7 +108,7 @@ namespace ps2x::iop::detail
+@@ -105,7 +109,7 @@ namespace ps2x::iop::detail
                heaplib(memory),
                intrman(memory),
                timrman(),
@@ -488,7 +489,21 @@ index e5f63a9..5ba1a77 100644
                cpuCore(memory),
                imports(memory),
                loadcore(memory, imports)
-@@ -558,12 +561,24 @@ namespace ps2x::iop::detail
+@@ -378,6 +382,13 @@ namespace ps2x::iop::detail
+             if (checkInterrupt(cpu))
+                 return true;
+ 
++            if (!hleHooks.empty() && tryHle(cpu))
++            {
++                ++totalInstructions;
++                ++totalCycles;
++                return !cpu.stopped;
++            }
++
+             if (const auto import = imports.decode(cpu.pc))
+             {
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+@@ -558,12 +569,24 @@ namespace ps2x::iop::detail
              try
              {
                  const uint64_t target = totalCycles + cycles;
@@ -514,7 +529,7 @@ index e5f63a9..5ba1a77 100644
                      if (!next)
                      {
                          uint64_t nextWake = kernel.nextWakeCycle(target);
-@@ -577,9 +592,36 @@ namespace ps2x::iop::detail
+@@ -577,9 +600,36 @@ namespace ps2x::iop::detail
                      }
                      const uint64_t before = totalCycles;
                      runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
@@ -551,6 +566,209 @@ index e5f63a9..5ba1a77 100644
                  }
              }
              catch (...)
+@@ -631,6 +681,7 @@ namespace ps2x::iop::detail
+             result.moduleId = module.id;
+             result.startResult = static_cast<int32_t>(startResult);
+             modules[module.id] = std::move(module);
++            scanHleSignatures(modules[result.moduleId]);
+ 
+             std::ostringstream out;
+             out << "[IOP] loaded IRX id=" << result.moduleId
+@@ -679,6 +730,194 @@ namespace ps2x::iop::detail
+         }
+ 
+         IopHost &host;
++        // ---- HLE por assinatura (FUNCOES.md #62) -------------------------------------------------------
++        // Rotinas quentes de IRX substituidas por C++ nativo com o mesmo efeito em memoria. Ao carregar cada
++        // modulo, o codigo e varrido atras das primeiras instrucoes (sem relocacao) de cada rotina conhecida;
++        // so entao o PC e interceptado em step(). PS2X_IOP_HLE=0 desliga.
++        enum class HleKind : uint8_t
++        {
++            AdpcmMixStereo, // AGESND (Red Dead Revolver): decodifica ADPCM 4 bits e mistura em L/R com repeticao 1/2/4
++            AdpcmMixMono,   // AGESND: idem, um canal
++        };
++        struct HleHook
++        {
++            uint32_t pc = 0;
++            HleKind kind = HleKind::AdpcmMixStereo;
++            uint32_t table = 0; // tabela de passos (endereco relocado lido do lui/addiu do proprio codigo)
++        };
++        std::vector<HleHook> hleHooks;
++
++        static bool hleEnabled()
++        {
++            static const bool enabled = []() {
++                const char *v = std::getenv("PS2X_IOP_HLE");
++                return !v || std::atoi(v) != 0;
++            }();
++            return enabled;
++        }
++
++        uint32_t hleLuiAddiu(uint32_t luiAddress) const
++        {
++            const uint32_t lui = memory.read32(luiAddress);
++            const uint32_t addiu = memory.read32(luiAddress + 4u);
++            return ((lui & 0xFFFFu) << 16) + static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(addiu & 0xFFFFu)));
++        }
++
++        void scanHleSignatures(const Module &module)
++        {
++            if (!hleEnabled())
++                return;
++            static constexpr uint32_t kStereo[] = {0x27bdfff0u, 0x0000c021u, 0x24aa0200u, 0x00806821u, 0xafb3000cu, 0xafb20008u,
++                                                   0xafb10004u, 0xafb00000u, 0x80e20002u, 0x84eb0000u, 0x8fae0020u, 0x8faf0024u};
++            static constexpr uint32_t kMono[] = {0x00006821u, 0x00805821u, 0x80e20002u, 0x84ea0000u, 0x8fb80010u, 0x18c00033u,
++                                                 0x000218c0u};
++            auto matches = [this](uint32_t address, const uint32_t *words, size_t count) {
++                for (size_t i = 0; i < count; ++i)
++                    if (memory.read32(address + static_cast<uint32_t>(i) * 4u) != words[i])
++                        return false;
++                return true;
++            };
++            for (uint32_t a = module.base; a + 64u <= module.base + module.size; a += 4u)
++            {
++                if (matches(a, kStereo, std::size(kStereo)))
++                {
++                    hleHooks.push_back({a, HleKind::AdpcmMixStereo, hleLuiAddiu(a + 0x44u)});
++                    std::ostringstream out;
++                    out << "[IOP] HLE AdpcmMixStereo em 0x" << std::hex << a << " (" << module.name << ") tabela=0x"
++                        << hleHooks.back().table;
++                    log(LogLevel::Info, out.str());
++                }
++                else if (matches(a, kMono, std::size(kMono)))
++                {
++                    hleHooks.push_back({a, HleKind::AdpcmMixMono, hleLuiAddiu(a + 0x1Cu)});
++                    std::ostringstream out;
++                    out << "[IOP] HLE AdpcmMixMono em 0x" << std::hex << a << " (" << module.name << ") tabela=0x"
++                        << hleHooks.back().table;
++                    log(LogLevel::Info, out.str());
++                }
++            }
++        }
++
++        // Soma com saturacao em 16 bits sobre a amostra existente (lh/addu/sh com clamp da rotina original)
++        void hleMixSample(uint32_t address, int32_t value)
++        {
++            int32_t v = static_cast<int32_t>(static_cast<int16_t>(memory.read16(address))) + value;
++            if (v > 0x7FFF)
++                v = 0x7FFF;
++            else if (v < -0x8000)
++                v = -0x8000;
++            memory.write16(address, static_cast<uint16_t>(v));
++        }
++
++        // Passo do decodificador: escolhe o nibble pela paridade do contador, atualiza preditor e indice.
++        void hleAdpcmStep(int32_t count, uint32_t &src, int32_t &byte, int32_t &idx8, int32_t &pred, uint32_t table)
++        {
++            int32_t nib;
++            if ((count & 1) == 0)
++            {
++                const int32_t b = static_cast<int32_t>(static_cast<uint32_t>(memory.read8(src)) << 24);
++                ++src;
++                byte = b >> 24;
++                nib = b >> 28;
++            }
++            else
++                nib = byte & 0xF;
++            const int32_t mag = nib & 7;
++            const uint32_t off = static_cast<uint32_t>(idx8 + mag) << 2;
++            const int32_t diff = memory.read16(table + off);
++            idx8 = memory.read16(table + off + 2u);
++            if (nib == mag)
++            {
++                pred += diff;
++                if (pred > 0x7FFF)
++                    pred = 0x7FFF;
++            }
++            else
++            {
++                pred -= diff;
++                if (pred < -0x8000)
++                    pred = -0x8000;
++            }
++        }
++
++        static int32_t hleScale(int32_t pred, int32_t volume)
++        {
++            // mult + mflo (32 bits baixos) + sra 7
++            const uint32_t lo = static_cast<uint32_t>(static_cast<int64_t>(pred) * static_cast<int64_t>(volume));
++            return static_cast<int32_t>(lo) >> 7;
++        }
++
++        bool tryHle(CpuState &cpu)
++        {
++            const HleHook *hook = nullptr;
++            for (const HleHook &h : hleHooks)
++                if (h.pc == cpu.pc)
++                {
++                    hook = &h;
++                    break;
++                }
++            if (!hook)
++                return false;
++            if (cpu.pendingLoad)
++            {
++                if (cpu.pendingLoadReg != 0u)
++                    cpu.gpr[cpu.pendingLoadReg] = cpu.pendingLoadValue;
++                cpu.pendingLoad = false;
++            }
++            auto &g = cpu.gpr;
++            const uint32_t sp = g[29];
++            uint32_t src = g[4];
++            const uint32_t state = g[7];
++            int32_t count = static_cast<int32_t>(g[6]);
++            int32_t idx8 = static_cast<int32_t>(static_cast<int8_t>(memory.read8(state + 2u))) << 3;
++            int32_t pred = static_cast<int16_t>(memory.read16(state));
++            int32_t byte = 0;
++            const int32_t samples = count > 0 ? count : 0;
++            if (hook->kind == HleKind::AdpcmMixStereo)
++            {
++                uint32_t outL = g[5];
++                uint32_t outR = g[5] + 0x200u;
++                const uint32_t quad = memory.read32(sp + 0x10u);
++                const uint32_t pairFlag = memory.read32(sp + 0x14u);
++                const uint32_t skipRight = memory.read32(sp + 0x18u);
++                const int32_t volL = static_cast<int32_t>(memory.read32(sp + 0x1Cu));
++                const int32_t volR = static_cast<int32_t>(memory.read32(sp + 0x20u));
++                const int writes = quad != 0u ? 4 : (pairFlag != 0u ? 2 : 1);
++                for (; count > 0; --count)
++                {
++                    hleAdpcmStep(count, src, byte, idx8, pred, hook->table);
++                    const int32_t l = hleScale(pred, volL);
++                    for (int w = 0; w < writes; ++w, outL += 2u)
++                        hleMixSample(outL, l);
++                    if (skipRight == 0u)
++                    {
++                        const int32_t r = hleScale(pred, volR);
++                        for (int w = 0; w < writes; ++w, outR += 2u)
++                            hleMixSample(outR, r);
++                    }
++                }
++            }
++            else
++            {
++                uint32_t out = g[5];
++                const int32_t vol = static_cast<int32_t>(memory.read32(sp + 0x10u));
++                for (; count > 0; --count, out += 2u)
++                {
++                    hleAdpcmStep(count, src, byte, idx8, pred, hook->table);
++                    hleMixSample(out, hleScale(pred, vol));
++                }
++            }
++            const int32_t index = idx8 >> 3;
++            memory.write16(state, static_cast<uint16_t>(pred));
++            memory.write8(state + 2u, static_cast<uint8_t>(index));
++            g[2] = static_cast<uint32_t>(index);
++            cpu.pc = g[31];
++            cpu.branchPending = false;
++            // custo aproximado da rotina interpretada, para o relogio do IOP seguir parecido
++            totalCycles += static_cast<uint64_t>(samples) * 40u;
++            return true;
++        }
++
+         IopMemory memory;
+         IopSysmem sysmem;
+         IopKernel kernel;
 diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
 index cf4fdc6..94274a8 100644
 --- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
@@ -916,7 +1134,7 @@ index d0fc95d..1339ea3 100644
                          inst.rd, inst.rt, inst.rt, shuffle_pattern);
                  }
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index 589d768..699f44e 100644
+index 589d768..f436f9b 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -12,6 +12,7 @@ option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
@@ -927,7 +1145,24 @@ index 589d768..699f44e 100644
  option(PS2X_ENABLE_IOP_RPC_TRACE "Log unhandled IOP/SIF RPC trace suggestions" ON)
  option(PS2X_STRICT_RETURN_DIAGNOSTICS "Route generated JR $ra returns through runtime branch diagnostics" OFF)
  option(PS2X_SHOW_WINDOWS_CONSOLE "Show a console window for ps2EntryRunner on Windows release builds" ON)
-@@ -405,6 +406,11 @@ endif()
+@@ -383,6 +384,8 @@ add_library(ps2_runtime STATIC
+     src/lib/gs/ps2_gs_memory.cpp
+     src/lib/gs/gs_frontend.cpp
+     src/lib/gs/gs_cpu_backend.cpp
++    src/lib/gs/gs_threaded_backend.cpp
++    src/lib/gs/gs_parallel_bridge.cpp
+     src/lib/ps2_iop_host.cpp
+     src/lib/ps2_memory.cpp
+     src/lib/ps2_pad.cpp
+@@ -391,6 +394,7 @@ add_library(ps2_runtime STATIC
+     src/lib/ps2_runtime.cpp
+     src/lib/ps2_vif1_interpreter.cpp
+     src/lib/vu/ps2_vu1_core.cpp
++    src/lib/vu/ps2_vu1_compiled.cpp
+     src/lib/vu/ps2_vu1_upper.cpp
+     src/lib/vu/ps2_vu1_lower.cpp
+     src/lib/games_database.cpp
+@@ -405,6 +409,11 @@ endif()
  if(PS2X_ENABLE_AGRESSIVE_LOGS)
      target_compile_definitions(ps2_runtime PUBLIC
          AGRESSIVE_LOGS=1
@@ -939,6 +1174,24 @@ index 589d768..699f44e 100644
          PS2_FUNCTION_LOG_TRACKER=1
      )
  endif()
+@@ -507,6 +516,17 @@ target_include_directories(ps2_runtime PUBLIC
+ )
+ 
+ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++
++# GS na GPU via paraLLEl-GS (opcional, LGPL-3.0). -DPS2X_PARALLEL_GS_DIR=<checkout com submodulos>;
++# em tempo de execucao PS2X_GS_BACKEND=parallel ativa (FUNCOES.md #65).
++set(PS2X_PARALLEL_GS_DIR "" CACHE PATH "paraLLEl-GS checkout (vazio = desativado)")
++if(PS2X_PARALLEL_GS_DIR)
++    set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
++    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
++    add_subdirectory("${PS2X_PARALLEL_GS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
++    target_link_libraries(ps2_runtime PRIVATE parallel-gs)
++    target_compile_definitions(ps2_runtime PRIVATE PS2X_HAS_PARALLEL_GS=1)
++endif()
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
 index 4b9242c..9bdf602 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
@@ -1155,6 +1408,40 @@ index f247ff9..4916e39 100644
      void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
      [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
      uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+index 2421f9e..b60968d 100644
+--- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
++++ b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
+@@ -4,6 +4,7 @@
+ #include "runtime/gs/gs_texture_page_cache.h"
+ 
+ #include <array>
++#include <atomic>
+ #include <mutex>
+ #include <vector>
+ 
+@@ -33,6 +34,10 @@ public:
+     void SnapshotVram(std::vector<uint8_t> &out) const override;
+     GSTransferSnapshot GetTransferSnapshot() const override;
+ 
++    // Desenha sem a trava do backend (FUNCOES.md #56): para as threads de faixa do GSThreadedBackend, que
++    // garantem que nenhum comando que muda VRAM/CLUT roda ao mesmo tempo e que as faixas nao se sobrepoem.
++    void SubmitBand(const GSPrimitiveBatch &batch);
++
+ private:
+     void ResetUnlocked();
+     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+@@ -72,7 +77,9 @@ private:
+     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
+     std::array<uint16_t, 512> m_clut{};
+     std::array<uint32_t, 2> m_clutCbp{};
+-    GSMem::TexturePageCache m_texturePageCache;
++    // Cache de pagina de textura por thread (as faixas desenham em paralelo); invalidar = nova geracao.
++    GSMem::TexturePageCache &threadTextureCache();
++    std::atomic<uint32_t> m_textureCacheGeneration{0};
+ 
+     GSTransferCommand m_transfer{};
+     GSTransferSnapshot m_transferState{};
 diff --git a/ps2xRuntime/include/runtime/gs/gs_draw_stats.h b/ps2xRuntime/include/runtime/gs/gs_draw_stats.h
 new file mode 100644
 index 0000000..f3ef306
@@ -1255,17 +1542,76 @@ index 0000000..25e63c4
 +}
 +
 +#endif // PS2_MPEG_OPTIONS_H
+diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
+index 67c8184..47ec13b 100644
+--- a/ps2xRuntime/include/runtime/ps2_vu1.h
++++ b/ps2xRuntime/include/runtime/ps2_vu1.h
+@@ -62,6 +62,10 @@ public:
+     VU1State &state() { return m_state; }
+     const VU1State &state() const { return m_state; }
+ 
++    // Microprogramas recompilados (src/lib/vu/ps2_vu1_compiled.h, FUNCOES.md #61) reproduzem o laco de
++    // run() par a par e usam os pipelines internos (flags, Q/P, stores, VI, XGKICK) deste interpretador.
++    friend struct Vu1Compiled;
++
+ private:
+     enum Pipeline : uint8_t
+     {
+@@ -225,6 +229,14 @@ private:
+     std::array<uint64_t, 4> m_accLatestWrite{};
+ 
+     uint64_t m_cycle = 0;
++    // Menor readyCycle pendente nos pipelines (FUNCOES.md #57): commitReadyPipelines so varre ao chegar nele.
++    uint64_t m_nextCommitCycle = 0;
++    // Bits dos slots ocupados em cada pipeline (FUNCOES.md #57): o commit percorre so os ocupados.
++    uint32_t m_flagValidMask = 0;
++    uint32_t m_storeValidMask = 0;
++    uint32_t m_vfValidMask = 0;
++    uint32_t m_viValidMask = 0;
++    uint32_t m_accValidMask = 0;
+     uint64_t m_nextWriteSequence = 0;
+     uint64_t m_efuResourceReady = 0;
+     uint32_t m_workingClip = 0;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..6825993 100644
+index c5e31c4..357838e 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
++#include <cstdlib>
 +#include <chrono>
 +#include "runtime/gs/gs_draw_stats.h"
  #include "runtime/ee_scheduler.h"
  
  #include "ps2_log.h"
-@@ -392,6 +394,17 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+@@ -173,6 +176,27 @@ void EeScheduler::run()
+                 copyMainContextToRuntime();
+                 publishIdleDebugContext();
+                 publishSnapshot();
++                if (ps2_gs_stats::statsEnabled())
++                {
++                    // Diagnostico (FUNCOES.md #63): por que o EE ficou ocioso e por quanto tempo
++                    for (const auto &[id, thread] : m_threads)
++                    {
++                        if (thread.status != EeThreadStatus::Waiting)
++                            continue;
++                        int detail = 0;
++                        if (const auto *sema = std::get_if<EeSemaphoreWait>(&thread.wait.payload))
++                            detail = sema->id;
++                        char name[64];
++                        std::snprintf(name, sizeof(name), "ee.idle.t%d.r%d.%d", id, static_cast<int>(thread.wait.reason), detail);
++                        ps2_gs_stats::countEvent(name);
++                    }
++                    const auto idleStart = std::chrono::steady_clock::now();
++                    waitForEvent();
++                    const auto idleMs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - idleStart).count() / 1000;
++                    for (long long i = 0; i < idleMs; ++i)
++                        ps2_gs_stats::countEvent("ee.idle_ms");
++                    continue;
++                }
+                 waitForEvent();
+                 continue;
+             }
+@@ -392,6 +416,17 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
  {
      const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
      m_eeCycle += elapsed;
@@ -1283,10 +1629,13 @@ index c5e31c4..6825993 100644
      m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
      m_runtime.advanceIopEeCycles(elapsed);
      if (m_pendingEeTimerInterrupts != 0u)
-@@ -1252,6 +1265,24 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+@@ -1252,6 +1287,28 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
      return KE_OK;
  }
  
++// Bits de IRQ do GS (1 = SIGNAL, 2 = FINISH) ja sinalizados e ainda nao reconhecidos (FUNCOES.md #63)
++static uint32_t s_gsIrqRaised = 0u;
++
 +void EeScheduler::dispatchGsIrqIfPending()
 +{
 +    // INTC cause 0 (GS): raised while GS_CSR has SIGNAL/FINISH set and GS_IMR does not mask it.
@@ -1303,12 +1652,47 @@ index c5e31c4..6825993 100644
 +            ps2_gs_stats::countEvent("gs.finish_irq");
 +        dispatchIrq(false, 0u);
 +    }
++    s_gsIrqRaised = (signalPending ? 1u : 0u) | (finishPending ? 2u : 0u);
 +}
 +
  void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
  {
      assertExecutor();
-@@ -1901,12 +1932,14 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1763,6 +1820,33 @@ void EeScheduler::processPendingEvents()
+         processEvent(event);
+     }
+ 
++    // IRQ do GS por borda (FUNCOES.md #63): antes so era despachada nos eventos de VBlank, entao cada
++    // espera do jogo por FINISH/SIGNAL custava ate meio campo com o EE ocioso. Um bit novo (nao mascarado)
++    // dispara aqui; bit ja sinalizado so volta a disparar depois que o handler limpar o CSR.
++    // PS2X_GS_IRQ_EDGE=0 volta a so consultar no VBlank.
++    {
++        static const bool s_edge = []() {
++            const char *v = std::getenv("PS2X_GS_IRQ_EDGE");
++            return !v || std::atoi(v) != 0;
++        }();
++        if (s_edge)
++        {
++            GSRegisters &gs = m_runtime.memory().gs();
++            const uint64_t csr = gs.csr.load(std::memory_order_acquire);
++            const uint64_t imr = gs.imr;
++            const uint32_t pendingBits = (((csr & 0x1u) != 0u && (imr & 0x100u) == 0u) ? 1u : 0u) |
++                                         (((csr & 0x2u) != 0u && (imr & 0x200u) == 0u) ? 2u : 0u);
++            s_gsIrqRaised &= pendingBits; // bits reconhecidos rearmam
++            if ((pendingBits & ~s_gsIrqRaised) != 0u)
++            {
++                if ((pendingBits & ~s_gsIrqRaised & 2u) != 0u)
++                    ps2_gs_stats::countEvent("gs.finish_irq");
++                dispatchIrq(false, 0u);
++                s_gsIrqRaised = pendingBits;
++            }
++        }
++    }
++
+     {
+         std::lock_guard lock(m_eventMutex);
+         const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+@@ -1901,12 +1985,14 @@ void EeScheduler::processEvent(const EeEvent &event)
              queueInvocation(std::move(invocation));
          }
          dispatchIrq(false, 2u);
@@ -1323,7 +1707,7 @@ index c5e31c4..6825993 100644
          break;
      case EeEventType::Dmac:
          break;
-@@ -1919,6 +1952,14 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1919,6 +2005,14 @@ void EeScheduler::processEvent(const EeEvent &event)
          }
          const EeAlarm alarm = it->second;
          m_alarms.erase(it);
@@ -1842,7 +2226,7 @@ index 9614016..4d4b22f 100644
                                       << " a0_64=0x" << GPR_U64(ctx, 4)
                                       << " a0_32=0x" << getRegU32(ctx, 4)
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
-index f0ad507..6ded1ad 100644
+index f0ad507..3f2cc4b 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 @@ -6,6 +6,11 @@
@@ -1857,8 +2241,80 @@ index f0ad507..6ded1ad 100644
  #include <atomic>
  #include <algorithm>
  #include <cmath>
-@@ -712,6 +717,72 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+@@ -296,7 +301,8 @@ namespace
+     {
+         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
+         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
+-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
++        // valores >= 0: (int)(x + 0.5f) == lround(x), sem a chamada da CRT por canal (FUNCOES.md #64)
++        return clampU8(static_cast<int>(top + (bottom - top) * fy + 0.5f));
+     }
+ }
+ 
+@@ -534,7 +540,7 @@ void GSCpuBackend::ResetUnlocked()
  {
+     m_clut.fill(0u);
+     m_clutCbp.fill(0u);
+-    m_texturePageCache.Invalidate();
++    m_textureCacheGeneration.fetch_add(1u, std::memory_order_relaxed);
+     m_transfer = {};
+     m_transfer.direction = 3u;
+     m_transferState = {};
+@@ -551,6 +557,28 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
+     DrawPrimitive(batch);
+ }
+ 
++void GSCpuBackend::SubmitBand(const GSPrimitiveBatch &batch)
++{
++    if (!m_vram || batch.vertexCount == 0u)
++        return;
++    DrawPrimitive(batch);
++}
++
++GSMem::TexturePageCache &GSCpuBackend::threadTextureCache()
++{
++    thread_local GSMem::TexturePageCache cache;
++    thread_local const GSCpuBackend *owner = nullptr;
++    thread_local uint32_t generation = UINT32_MAX;
++    const uint32_t current = m_textureCacheGeneration.load(std::memory_order_relaxed);
++    if (owner != this || generation != current)
++    {
++        cache.Invalidate();
++        owner = this;
++        generation = current;
++    }
++    return cache;
++}
++
+ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+@@ -644,7 +672,7 @@ void GSCpuBackend::Flush()
+ void GSCpuBackend::TextureFlush()
+ {
+     std::lock_guard<std::mutex> lock(m_mutex);
+-    m_texturePageCache.Invalidate();
++    m_textureCacheGeneration.fetch_add(1u, std::memory_order_relaxed);
+ }
+ 
+ void GSCpuBackend::Sync(GSSyncReason)
+@@ -670,7 +698,7 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
+     if (!m_vram)
+         return 0u;
+ 
+-    return GSMem::ReadTexture(m_texturePageCache, m_vram, psm, base, bw, x, y);
++    return GSMem::ReadTexture(threadTextureCache(), m_vram, psm, base, bw, x, y);
+ }
+ 
+ void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+@@ -710,8 +738,78 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
+ 
+ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
+ {
++    // Experimento (FUNCOES.md #64): PS2X_GS_NODRAW=1 descarta as primitivas, para medir se o GS e o caminho critico
++    static const bool s_noDraw = std::getenv("PS2X_GS_NODRAW") != nullptr;
++    if (s_noDraw)
++        return;
      const GSDrawState &state = batch.state;
      const auto &ctx = state.context;
 +    if (ps2_gs_stats::takePrimTraceSlot())
@@ -1930,7 +2386,23 @@ index f0ad507..6ded1ad 100644
      PS2_IF_AGRESSIVE_LOGS({
          const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
          if (primitiveIndex < 64u)
-@@ -1470,6 +1541,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1083,12 +1181,14 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
+         texVf = t * invQ * static_cast<float>(texH);
+     }
+ 
++    // cache de pagina da thread obtido uma vez por amostra (antes: por texel; FUNCOES.md #64)
++    GSMem::TexturePageCache &textureCache = threadTextureCache();
+     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
+     {
+         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
+         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
+ 
+-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
++        u32 out = m_vram ? GSMem::ReadTexture(textureCache, m_vram, tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV) : 0u;
+ 
+         switch (tex.psm)
+         {
+@@ -1470,6 +1570,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
      m_transferState.copiedPixels = 0u;
      m_transferState.direction = command.direction;
      m_transferState.localToHostPendingBytes = 0u;
@@ -1949,7 +2421,7 @@ index f0ad507..6ded1ad 100644
  
      if (command.direction == 2u)
          PerformLocalToLocalTransfer();
-@@ -1480,6 +1563,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
+@@ -1480,6 +1592,18 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
  void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
  {
      std::lock_guard<std::mutex> lock(m_mutex);
@@ -1969,10 +2441,12 @@ index f0ad507..6ded1ad 100644
          return;
      if (m_transfer.trxreg.rrw == 0u || m_transfer.trxreg.rrh == 0u || m_transferState.totalPixels == 0u)
 diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-index 5658928..4c35b2f 100644
+index 5658928..81b4d77 100644
 --- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
-@@ -1,7 +1,11 @@
+@@ -1,7 +1,13 @@
++#include "gs_threaded_backend.h"
++#include "gs_parallel_bridge.h"
 +#include <cstdlib>
  #include "runtime/gs/gs_frontend.h"
  #include "runtime/gs/gs_cpu_backend.h"
@@ -1984,7 +2458,36 @@ index 5658928..4c35b2f 100644
  #include <atomic>
  #include <algorithm>
  #include <cmath>
-@@ -408,8 +412,130 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
+@@ -105,8 +111,16 @@ namespace
+ }
+ 
+ 
++// Backend padrao: o rasterizador em CPU, numa thread propria salvo PS2X_GS_THREAD=0 (FUNCOES.md #55).
++static std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
++{
++    if (GSThreadedBackend::EnabledByEnvironment())
++        return std::make_unique<GSThreadedBackend>(std::make_unique<GSCpuBackend>());
++    return std::make_unique<GSCpuBackend>();
++}
++
+ GS::GS()
+-    : m_backend(std::make_unique<GSCpuBackend>())
++    : m_backend(makeDefaultRasterBackend())
+ {
+     reset();
+ }
+@@ -116,8 +130,9 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
+     m_localMemoryStorage = vram;
+     m_localMemorySize = vramSize;
+     m_privRegs = privRegs;
++    ps2_gs_parallel::bindPrivRegs(privRegs);
+     if (!m_backend)
+-        m_backend = std::make_unique<GSCpuBackend>();
++        m_backend = makeDefaultRasterBackend();
+     m_backend->Initialize(vram, vramSize);
+     reset();
+ }
+@@ -408,8 +423,130 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
      recordDebugEventUnlocked(entry);
  }
  
@@ -2115,6 +2618,912 @@ index 5658928..4c35b2f 100644
      if (m_debugHistoryPaused)
      {
          return;
+@@ -640,6 +777,11 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
+ 
+ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (ps2_gs_parallel::active())
++    {
++        ps2_gs_parallel::gifTransfer(data, sizeBytes);
++        return;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16 || !m_backend)
+         return;
+@@ -738,6 +880,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ 
+ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+ {
++    if (ps2_gs_parallel::active())
++    {
++        ps2_gs_parallel::setCurrentPath(3u);
++        ps2_gs_parallel::gifTransfer(data, sizeBytes);
++        return true;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     if (!data || sizeBytes < 16u || !m_backend)
+         return false;
+@@ -783,6 +931,12 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
+                            const uint8_t *data,
+                            uint32_t sizeBytes)
+ {
++    if (ps2_gs_parallel::active())
++    {
++        ps2_gs_parallel::setCurrentPath(3u);
++        ps2_gs_parallel::uploadImage(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
++        return;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
+ }
+@@ -1061,6 +1215,11 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
+ 
+ void GS::writeRegister(uint8_t regAddr, uint64_t value)
+ {
++    if (ps2_gs_parallel::active())
++    {
++        ps2_gs_parallel::writeRegister(regAddr, value);
++        return;
++    }
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     writeRegisterUnlocked(regAddr, value);
+ }
+@@ -1476,6 +1635,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
+     }
+     case GS_REG_FINISH:
+     {
++        // metrica de quadros independente do despacho da IRQ (FUNCOES.md #63)
++        ps2_gs_stats::countEvent("gs.finish");
+         if (m_backend)
+         {
+             m_backend->Flush();
+@@ -1628,6 +1789,8 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
+ 
+ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ {
++    if (ps2_gs_parallel::active())
++        return ps2_gs_parallel::readTransfer(dst, maxBytes);
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+ }
+@@ -1635,7 +1798,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
+ {
+     if (!backend)
+-        backend = std::make_unique<GSCpuBackend>();
++        backend = makeDefaultRasterBackend();
+ 
+     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp
+new file mode 100644
+index 0000000..2379aa0
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp
+@@ -0,0 +1,318 @@
++#include "gs_parallel_bridge.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++#if PS2X_HAS_PARALLEL_GS
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include "context.hpp"
++#include "device.hpp"
++#include "gs_interface.hpp"
++#include "thread_id.hpp"
++
++#include "runtime/gs/gs_draw_stats.h"
++#include "runtime/ps2_memory.h"
++
++namespace
++{
++    // SIGNAL/FINISH/LABEL do fluxo GIF atualizam CSR/SIGLBLID como o GS de software (gs_frontend.cpp)
++    struct PrivSignals final : ParallelGS::SignalInterface
++    {
++        GSRegisters *regs = nullptr;
++
++        bool on_signal(uint64_t value) override
++        {
++            if (regs)
++            {
++                const uint32_t id = static_cast<uint32_t>(value);
++                const uint32_t mask = static_cast<uint32_t>(value >> 32);
++                uint32_t lo = static_cast<uint32_t>(regs->siglblid);
++                lo = (lo & ~mask) | (id & mask);
++                regs->siglblid = (regs->siglblid & 0xFFFFFFFF00000000ull) | lo;
++                regs->csr.fetch_or(0x1);
++            }
++            return false;
++        }
++
++        bool on_finish(uint64_t) override
++        {
++            ps2_gs_stats::countEvent("gs.finish");
++            if (regs)
++                regs->csr.fetch_or(0x2);
++            return false;
++        }
++
++        bool on_label(uint64_t value) override
++        {
++            if (regs)
++            {
++                const uint32_t id = static_cast<uint32_t>(value);
++                const uint32_t mask = static_cast<uint32_t>(value >> 32);
++                uint32_t hi = static_cast<uint32_t>(regs->siglblid >> 32);
++                hi = (hi & ~mask) | (id & mask);
++                regs->siglblid = (static_cast<uint64_t>(hi) << 32) | (regs->siglblid & 0xFFFFFFFFull);
++            }
++            return false;
++        }
++    };
++
++    struct Bridge
++    {
++        Vulkan::Context context;
++        Vulkan::Device device;
++        ParallelGS::GSInterface iface;
++        PrivSignals signals;
++        std::mutex mutex;
++    };
++
++    Bridge *g_bridge = nullptr;
++    std::once_flag g_initOnce;
++    thread_local uint32_t t_path = 3u;
++
++    bool requested()
++    {
++        const char *v = std::getenv("PS2X_GS_BACKEND");
++        return v && std::strcmp(v, "parallel") == 0;
++    }
++
++    void init()
++    {
++        if (!requested())
++            return;
++        Util::register_thread_index(0);
++        if (!Vulkan::Context::init_loader(nullptr))
++        {
++            std::fprintf(stderr, "[gs-parallel] loader Vulkan indisponivel; usando o GS de software\n");
++            return;
++        }
++        auto *bridge = new Bridge();
++        bridge->context.set_num_thread_indices(1);
++        if (!bridge->context.init_instance_and_device(nullptr, 0, nullptr, 0,
++                                                      Vulkan::CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
++                                                          Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT |
++                                                          Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
++        {
++            std::fprintf(stderr, "[gs-parallel] falha ao criar o device Vulkan; usando o GS de software\n");
++            delete bridge;
++            return;
++        }
++        bridge->device.set_context(bridge->context);
++        bridge->device.init_frame_contexts(4);
++        ParallelGS::GSOptions options = {};
++        if (const char *ss = std::getenv("PS2X_GS_SSAA"))
++        {
++            switch (std::atoi(ss))
++            {
++            case 2: options.super_sampling = ParallelGS::SuperSampling::X2; break;
++            case 4: options.super_sampling = ParallelGS::SuperSampling::X4; break;
++            case 8: options.super_sampling = ParallelGS::SuperSampling::X8; break;
++            case 16: options.super_sampling = ParallelGS::SuperSampling::X16; break;
++            default: break;
++            }
++        }
++        if (!bridge->iface.init(&bridge->device, options))
++        {
++            std::fprintf(stderr, "[gs-parallel] GSInterface::init falhou; usando o GS de software\n");
++            delete bridge;
++            return;
++        }
++        bridge->iface.set_signal_interface(&bridge->signals);
++        std::fprintf(stderr, "[gs-parallel] ativo: %s\n", bridge->device.get_gpu_properties().deviceName);
++        g_bridge = bridge;
++    }
++
++    // Pacote GIF PACKED A+D com `count` registradores
++    void appendAdTag(std::vector<uint64_t> &q, uint32_t count)
++    {
++        q.push_back(static_cast<uint64_t>(count) | (1ull << 15) | (1ull << 60));
++        q.push_back(0xEull);
++    }
++}
++
++namespace ps2_gs_parallel
++{
++    bool active()
++    {
++        std::call_once(g_initOnce, init);
++        return g_bridge != nullptr;
++    }
++
++    void bindPrivRegs(GSRegisters *regs)
++    {
++        if (!active())
++            return;
++        std::lock_guard<std::mutex> lock(g_bridge->mutex);
++        g_bridge->signals.regs = regs;
++    }
++
++    void setCurrentPath(uint32_t path)
++    {
++        t_path = path;
++    }
++
++    void gifTransfer(const uint8_t *data, uint32_t sizeBytes)
++    {
++        if (!g_bridge || !data || sizeBytes < 16u)
++            return;
++        std::lock_guard<std::mutex> lock(g_bridge->mutex);
++        Util::register_thread_index(0);
++        // Os pacotes do runtime sao autocontidos: o VIF1 corta IMAGE do PATH2 e reembala cada pedaco com uma
++        // tag IMAGE nova (ps2_vif1_interpreter.cpp emitDirectPayload). O paraLLEl-GS guarda o estado do caminho
++        // entre transferencias e leria essa tag como pixel, desalinhando o fluxo. Comeca cada pacote numa tag.
++        {
++            auto &path = g_bridge->iface.get_gif_path(t_path & 3u);
++            path.loop = path.tag.NLOOP;
++            path.reg = 0;
++        }
++        g_bridge->iface.gif_transfer(t_path, data, sizeBytes & ~15u);
++        if (ps2_gs_stats::statsEnabled())
++        {
++            static const char *const kNames[4] = {"pgs.path0", "pgs.path1", "pgs.path2", "pgs.path3"};
++            static const char *const kPartial[4] = {"pgs.partial0", "pgs.partial1", "pgs.partial2", "pgs.partial3"};
++            const uint32_t p = t_path & 3u;
++            ps2_gs_stats::countEvent(kNames[p]);
++            const auto &path = g_bridge->iface.get_gif_path(p);
++            if (path.loop != path.tag.NLOOP)
++                ps2_gs_stats::countEvent(kPartial[p]);
++        }
++    }
++
++    void writeRegister(uint8_t regAddr, uint64_t value)
++    {
++        std::vector<uint64_t> q;
++        appendAdTag(q, 1u);
++        q.push_back(value);
++        q.push_back(regAddr);
++        gifTransfer(reinterpret_cast<const uint8_t *>(q.data()), static_cast<uint32_t>(q.size() * 8u));
++    }
++
++    void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
++                     const uint8_t *data, uint32_t sizeBytes)
++    {
++        const uint32_t qwords = (sizeBytes + 15u) / 16u;
++        std::vector<uint64_t> q;
++        q.reserve(12u + static_cast<size_t>(qwords) * 2u);
++        appendAdTag(q, 4u);
++        const uint64_t regs[4][2] = {{bitbltbuf, 0x50u}, {trxpos, 0x51u}, {trxreg, 0x52u}, {trxdir, 0x53u}};
++        for (const auto &r : regs)
++        {
++            q.push_back(r[0]);
++            q.push_back(r[1]);
++        }
++        // IMAGE: NLOOP = qwords, EOP, FLG = 2
++        q.push_back(static_cast<uint64_t>(qwords & 0x7FFFu) | (1ull << 15) | (2ull << 58));
++        q.push_back(0u);
++        const size_t start = q.size();
++        q.resize(start + static_cast<size_t>(qwords) * 2u, 0u);
++        if (data && sizeBytes)
++            std::memcpy(q.data() + start, data, sizeBytes);
++        gifTransfer(reinterpret_cast<const uint8_t *>(q.data()), static_cast<uint32_t>(q.size() * 8u));
++    }
++
++    uint32_t readTransfer(uint8_t *dst, uint32_t maxBytes)
++    {
++        if (!g_bridge || !dst || maxBytes < 16u)
++            return 0u;
++        std::lock_guard<std::mutex> lock(g_bridge->mutex);
++        Util::register_thread_index(0);
++        g_bridge->iface.read_transfer_fifo(dst, maxBytes / 16u);
++        return maxBytes & ~15u;
++    }
++
++    bool present(const GSRegisters &regs, uint32_t phase, std::vector<uint8_t> &outPixels,
++                 uint32_t &outWidth, uint32_t &outHeight)
++    {
++        if (!g_bridge)
++            return false;
++        std::lock_guard<std::mutex> lock(g_bridge->mutex);
++        Util::register_thread_index(0);
++        auto &iface = g_bridge->iface;
++        auto &device = g_bridge->device;
++
++        auto &priv = iface.get_priv_register_state();
++        const uint64_t lo[15] = {regs.pmode, regs.smode1, regs.smode2, regs.srfsh, regs.synch1,
++                                 regs.synch2, regs.syncv, regs.dispfb1, regs.display1, regs.dispfb2,
++                                 regs.display2, regs.extbuf, regs.extdata, regs.extwrite, regs.bgcolor};
++        for (uint32_t i = 0; i < 15u; ++i)
++            priv.qwords_lo[i * 2u] = lo[i];
++        // SMODE1 e escrito pelo kernel no SetGsCrt (o runtime nao escreve): sem ele o scanout nao reconhece o
++        // modo de video. Vazio => NTSC analogico (RC=4, LC=32, CMOD=2).
++        if (priv.smode1.LC == 0u)
++            priv.qwords_lo[1u * 2u] = 4ull | (32ull << 3) | (2ull << 13);
++
++        ParallelGS::VSyncInfo info = {};
++        info.phase = phase;
++        info.dst_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        info.dst_stage = VK_PIPELINE_STAGE_2_COPY_BIT;
++        info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
++        info.force_progressive = true;
++        info.anti_blur = true;
++        info.adapt_to_internal_horizontal_resolution = true;
++
++        iface.flush();
++        ParallelGS::ScanoutResult result = iface.vsync(info);
++        bool ok = false;
++        static const bool s_log = std::getenv("PS2X_GS_PARALLEL_LOG") != nullptr;
++        static uint64_t s_lastKey = ~0ull;
++        static uint32_t s_logCount = 0;
++        const uint64_t key = regs.pmode ^ (regs.smode2 << 8) ^ (regs.dispfb1 << 16) ^ (regs.dispfb2 << 24) ^ regs.display1 ^
++                             (result.image ? (uint64_t(result.image->get_width()) << 48) : 1ull);
++        if (s_log && (key != s_lastKey || (++s_logCount % 600u) == 0u) && (s_lastKey = key, true))
++            std::fprintf(stderr, "[gs-parallel] vsync pmode=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx img=%ux%u\n",
++                         (unsigned long long)regs.pmode, (unsigned long long)regs.smode2, (unsigned long long)regs.dispfb1,
++                         (unsigned long long)regs.display1, (unsigned long long)regs.dispfb2, (unsigned long long)regs.display2,
++                         result.image ? result.image->get_width() : 0u, result.image ? result.image->get_height() : 0u);
++        if (result.image)
++        {
++            const uint32_t w = result.image->get_width();
++            const uint32_t h = result.image->get_height();
++            Vulkan::BufferCreateInfo bufinfo = {};
++            bufinfo.size = static_cast<VkDeviceSize>(w) * h * 4u;
++            bufinfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++            bufinfo.domain = Vulkan::BufferDomain::CachedHost;
++            Vulkan::BufferHandle readback = device.create_buffer(bufinfo);
++
++            auto cmd = device.request_command_buffer();
++            cmd->copy_image_to_buffer(*readback, *result.image, 0, {}, {w, h, 1}, 0, 0,
++                                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++            cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                         VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++            Vulkan::Fence fence;
++            device.submit(cmd, &fence);
++            fence->wait();
++
++            const auto *pixels = static_cast<const uint8_t *>(device.map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT));
++            outPixels.resize(static_cast<size_t>(bufinfo.size));
++            std::memcpy(outPixels.data(), pixels, outPixels.size());
++            for (size_t i = 3; i < outPixels.size(); i += 4)
++                outPixels[i] = 0xFF;
++            device.unmap_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT);
++            outWidth = w;
++            outHeight = h;
++            ok = true;
++        }
++        device.next_frame_context();
++        return ok;
++    }
++}
++
++#else
++
++namespace ps2_gs_parallel
++{
++    bool active() { return false; }
++    void bindPrivRegs(GSRegisters *) {}
++    void setCurrentPath(uint32_t) {}
++    void gifTransfer(const uint8_t *, uint32_t) {}
++    void writeRegister(uint8_t, uint64_t) {}
++    void uploadImage(uint64_t, uint64_t, uint64_t, uint64_t, const uint8_t *, uint32_t) {}
++    uint32_t readTransfer(uint8_t *, uint32_t) { return 0u; }
++    bool present(const GSRegisters &, uint32_t, std::vector<uint8_t> &, uint32_t &, uint32_t &) { return false; }
++}
++
++#endif
+diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_bridge.h b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.h
+new file mode 100644
+index 0000000..3698f60
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++struct GSRegisters;
++
++// Ponte opcional para o paraLLEl-GS (GS em compute Vulkan na GPU, FUNCOES.md #65).
++// Ativa com PS2X_GS_BACKEND=parallel num build com PS2X_PARALLEL_GS_DIR. Quando ativa, todo o fluxo GIF que
++// chegaria ao GS de software vai para a GPU e a apresentacao le a imagem de scanout do paraLLEl-GS.
++namespace ps2_gs_parallel
++{
++    // Inicializa na primeira chamada (Vulkan + GSInterface). Falha de init => false e o GS de software segue.
++    bool active();
++    void bindPrivRegs(GSRegisters *regs);
++
++    // Caminho GIF (1..3) do pacote atual; o GifArbiter marca antes de entregar cada pacote.
++    void setCurrentPath(uint32_t path);
++
++    void gifTransfer(const uint8_t *data, uint32_t sizeBytes);
++    void writeRegister(uint8_t regAddr, uint64_t value);
++    void uploadImage(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg, uint64_t trxdir,
++                     const uint8_t *data, uint32_t sizeBytes);
++    uint32_t readTransfer(uint8_t *dst, uint32_t maxBytes);
++
++    // VBlank: copia os registradores privilegiados, faz o scanout e devolve RGBA8 (alpha = 0xFF).
++    bool present(const GSRegisters &regs, uint32_t phase, std::vector<uint8_t> &outPixels,
++                 uint32_t &outWidth, uint32_t &outHeight);
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+new file mode 100644
+index 0000000..b1fac39
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.cpp
+@@ -0,0 +1,335 @@
++#include "gs_threaded_backend.h"
++
++#include "runtime/gs/gs_draw_stats.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <utility>
++
++namespace
++{
++    // Limite da fila (comandos): acima disso a thread do jogo espera o GS alcancar, para a memoria nao
++    // crescer sem fim e o atraso de apresentacao ficar limitado.
++    constexpr size_t kMaxQueuedCommands = 32768u;
++    // Primitivas por lote de faixas; lotes menores que kMinParallelRun vao direto (sem sincronizar threads).
++    constexpr size_t kMaxRun = 1024u;
++    constexpr size_t kMinParallelRun = 8u;
++    // Altura das fatias intercaladas: a faixa b desenha as linhas [y0 + (k*N + b)*kSliceRows, ...).
++    constexpr int kSliceRows = 16;
++
++    bool sameTarget(const GSPrimitiveBatch &a, const GSPrimitiveBatch &b)
++    {
++        const GSContext &x = a.state.context;
++        const GSContext &y = b.state.context;
++        return x.scissor.x0 == y.scissor.x0 && x.scissor.x1 == y.scissor.x1 && x.scissor.y0 == y.scissor.y0 &&
++               x.scissor.y1 == y.scissor.y1 && x.frame.fbp == y.frame.fbp && x.frame.fbw == y.frame.fbw &&
++               x.frame.psm == y.frame.psm && x.zbuf.zbp == y.zbuf.zbp && x.zbuf.psm == y.zbuf.psm;
++    }
++
++    uint32_t bandCountFromEnvironment()
++    {
++        if (const char *env = std::getenv("PS2X_GS_BANDS"))
++            return static_cast<uint32_t>(std::clamp(std::atoi(env), 1, 16));
++        const int hw = static_cast<int>(std::thread::hardware_concurrency());
++        // medido no RDR (16 nucleos): 2->41, 4->61, 5->62, 8->55 quadros/600 vblanks; acima de 5 a sincronizacao
++        // e a disputa com a thread do jogo custam mais do que rendem (FUNCOES.md #64)
++        return static_cast<uint32_t>(std::clamp(hw - 2, 1, 5));
++    }
++}
++
++bool GSThreadedBackend::EnabledByEnvironment()
++{
++    const char *env = std::getenv("PS2X_GS_THREAD");
++    return !env || std::atoi(env) != 0;
++}
++
++GSThreadedBackend::GSThreadedBackend(std::unique_ptr<GSCpuBackend> inner)
++    : m_inner(std::move(inner))
++{
++    m_bandCount = bandCountFromEnvironment();
++    if (m_bandCount > 1u)
++        for (uint32_t b = 0; b < m_bandCount; ++b)
++            m_bandThreads.emplace_back([this, b]() { BandLoop(b); });
++    std::fprintf(stderr, "[gs] backend em thread propria, %u faixa(s) de rasterizacao\n", m_bandCount);
++    m_worker = std::thread([this]() { WorkerLoop(); });
++}
++
++GSThreadedBackend::~GSThreadedBackend()
++{
++    {
++        std::lock_guard<std::mutex> lock(m_queueMutex);
++        m_stop = true;
++    }
++    m_workAvailable.notify_all();
++    if (m_worker.joinable())
++        m_worker.join();
++    {
++        std::lock_guard<std::mutex> lock(m_bandMutex);
++        m_bandStop = true;
++    }
++    m_bandStart.notify_all();
++    for (std::thread &t : m_bandThreads)
++        if (t.joinable())
++            t.join();
++}
++
++void GSThreadedBackend::BandLoop(uint32_t band)
++{
++    uint64_t seen = 0;
++    for (;;)
++    {
++        const std::vector<GSPrimitiveBatch> *run = nullptr;
++        {
++            std::unique_lock<std::mutex> lock(m_bandMutex);
++            m_bandStart.wait(lock, [&]() { return m_bandStop || m_bandGeneration != seen; });
++            if (m_bandStop)
++                return;
++            seen = m_bandGeneration;
++            run = m_bandRun;
++        }
++        const int stride = static_cast<int>(m_bandCount) * kSliceRows;
++        for (const GSPrimitiveBatch &batch : *run)
++        {
++            const GSScissorReg &sc = batch.state.context.scissor;
++            GSPrimitiveBatch local = batch;
++            for (int y = static_cast<int>(sc.y0) + static_cast<int>(band) * kSliceRows; y <= static_cast<int>(sc.y1);
++                 y += stride)
++            {
++                local.state.context.scissor.y0 = static_cast<uint16_t>(y);
++                local.state.context.scissor.y1 = static_cast<uint16_t>(std::min<int>(y + kSliceRows - 1, sc.y1));
++                m_inner->SubmitBand(local);
++            }
++        }
++        {
++            std::lock_guard<std::mutex> lock(m_bandMutex);
++            if (--m_bandRemaining == 0u)
++                m_bandDone.notify_all();
++        }
++    }
++}
++
++void GSThreadedBackend::DrawRun(std::vector<GSPrimitiveBatch> &run)
++{
++    if (run.empty())
++        return;
++    // Rastreio de depuracao (F9) conta primitivas por chamada: fica serial para nao duplicar.
++    if (m_bandCount <= 1u || run.size() < kMinParallelRun || ps2_gs_stats::primTraceActive())
++    {
++        for (const GSPrimitiveBatch &batch : run)
++            m_inner->Submit(batch);
++        run.clear();
++        return;
++    }
++    std::unique_lock<std::mutex> lock(m_bandMutex);
++    m_bandRun = &run;
++    m_bandRemaining = m_bandCount;
++    ++m_bandGeneration;
++    m_bandStart.notify_all();
++    m_bandDone.wait(lock, [this]() { return m_bandRemaining == 0u; });
++    m_bandRun = nullptr;
++    lock.unlock();
++    run.clear();
++}
++
++void GSThreadedBackend::Push(Command &&command)
++{
++    std::unique_lock<std::mutex> lock(m_queueMutex);
++    m_spaceAvailable.wait(lock, [this]() { return m_queue.size() < kMaxQueuedCommands || m_stop; });
++    m_queue.push_back(std::move(command));
++    lock.unlock();
++    m_workAvailable.notify_one();
++}
++
++void GSThreadedBackend::Drain() const
++{
++    std::unique_lock<std::mutex> lock(m_queueMutex);
++    m_idle.wait(lock, [this]() { return (m_queue.empty() && !m_busy) || m_stop; });
++}
++
++void GSThreadedBackend::WorkerLoop()
++{
++    std::vector<GSPrimitiveBatch> run;
++    run.reserve(kMaxRun);
++    std::unique_lock<std::mutex> lock(m_queueMutex);
++    for (;;)
++    {
++        m_workAvailable.wait(lock, [this]() { return !m_queue.empty() || m_stop; });
++        if (m_queue.empty() && m_stop)
++            break;
++        Command command = std::move(m_queue.front());
++        m_queue.pop_front();
++        m_busy = true;
++        if (command.type == CommandType::Submit)
++        {
++            // Junta as primitivas seguintes com o mesmo alvo num lote para as faixas
++            run.push_back(command.batch);
++            while (!m_queue.empty() && run.size() < kMaxRun && m_queue.front().type == CommandType::Submit &&
++                   sameTarget(m_queue.front().batch, run.front()))
++            {
++                run.push_back(m_queue.front().batch);
++                m_queue.pop_front();
++            }
++            lock.unlock();
++            m_spaceAvailable.notify_all();
++            DrawRun(run);
++        }
++        else
++        {
++            lock.unlock();
++            m_spaceAvailable.notify_all();
++            Execute(command);
++        }
++
++        lock.lock();
++        m_busy = false;
++        if (m_queue.empty())
++            m_idle.notify_all();
++    }
++    m_idle.notify_all();
++}
++
++void GSThreadedBackend::Execute(Command &command)
++{
++    switch (command.type)
++    {
++    case CommandType::Submit:
++        m_inner->Submit(command.batch);
++        break;
++    case CommandType::LoadClut:
++        m_inner->LoadClut(command.tex0, command.texclut);
++        break;
++    case CommandType::BeginTransfer:
++        m_inner->BeginTransfer(command.transfer);
++        break;
++    case CommandType::UploadImage:
++        m_inner->UploadImage(command.data.data(), static_cast<uint32_t>(command.data.size()));
++        break;
++    case CommandType::TextureFlush:
++        m_inner->TextureFlush();
++        break;
++    case CommandType::WriteVram:
++        m_inner->WriteVram(command.args[0], command.args[1], command.args[2], command.args[3], command.args[4],
++                           command.args[5]);
++        break;
++    }
++}
++
++void GSThreadedBackend::Initialize(uint8_t *vram, uint32_t vramSize)
++{
++    Drain();
++    m_inner->Initialize(vram, vramSize);
++}
++
++void GSThreadedBackend::Reset()
++{
++    Drain();
++    m_inner->Reset();
++}
++
++void GSThreadedBackend::Submit(const GSPrimitiveBatch &batch)
++{
++    Command command;
++    command.type = CommandType::Submit;
++    command.batch = batch;
++    Push(std::move(command));
++}
++
++void GSThreadedBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
++{
++    Command command;
++    command.type = CommandType::LoadClut;
++    command.tex0 = tex0;
++    command.texclut = texclut;
++    Push(std::move(command));
++}
++
++void GSThreadedBackend::BeginTransfer(const GSTransferCommand &transfer)
++{
++    Command command;
++    command.type = CommandType::BeginTransfer;
++    command.transfer = transfer;
++    Push(std::move(command));
++}
++
++void GSThreadedBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
++{
++    if (!data || sizeBytes == 0u)
++        return;
++    Command command;
++    command.type = CommandType::UploadImage;
++    command.data.assign(data, data + sizeBytes);
++    Push(std::move(command));
++}
++
++void GSThreadedBackend::Flush()
++{
++    // Flush/Sync do frontend chegam juntos; a espera fica no Sync, que sabe o motivo.
++}
++
++void GSThreadedBackend::TextureFlush()
++{
++    Command command;
++    command.type = CommandType::TextureFlush;
++    Push(std::move(command));
++}
++
++void GSThreadedBackend::Sync(GSSyncReason reason)
++{
++    // A apresentacao (thread da janela) le o buffer exibido, que o jogo nao esta desenhando; esperar a
++    // fila ali deixaria a janela presa ao ritmo do jogo. Os demais motivos (FINISH, reset, leitura)
++    // precisam ver todo o desenho anterior.
++    if (reason != GSSyncReason::Presentation)
++        Drain();
++    m_inner->Flush();
++    m_inner->Sync(reason);
++}
++
++PresentationFrame GSThreadedBackend::Present(const GSPresentationRequest &request)
++{
++    return m_inner->Present(request);
++}
++
++bool GSThreadedBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
++{
++    Drain();
++    return m_inner->ClearFramebuffer(context, rgba);
++}
++
++uint32_t GSThreadedBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
++{
++    Drain();
++    return m_inner->ConsumeLocalToHostBytes(dst, maxBytes);
++}
++
++uint32_t GSThreadedBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
++{
++    Drain();
++    return m_inner->ReadVram(psm, base, bw, x, y);
++}
++
++void GSThreadedBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
++{
++    Command command;
++    command.type = CommandType::WriteVram;
++    command.args[0] = psm;
++    command.args[1] = base;
++    command.args[2] = bw;
++    command.args[3] = x;
++    command.args[4] = y;
++    command.args[5] = value;
++    Push(std::move(command));
++}
++
++void GSThreadedBackend::SnapshotVram(std::vector<uint8_t> &out) const
++{
++    Drain();
++    m_inner->SnapshotVram(out);
++}
++
++GSTransferSnapshot GSThreadedBackend::GetTransferSnapshot() const
++{
++    // So para depuracao/historico: le o estado atual sem esperar a fila.
++    return m_inner->GetTransferSnapshot();
++}
+diff --git a/ps2xRuntime/src/lib/gs/gs_threaded_backend.h b/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
+new file mode 100644
+index 0000000..de1866d
+--- /dev/null
++++ b/ps2xRuntime/src/lib/gs/gs_threaded_backend.h
+@@ -0,0 +1,103 @@
++#pragma once
++
++// Backend do GS em thread propria (FUNCOES.md #55). Envolve outro GSRasterBackend (o GSCpuBackend):
++// comandos que so escrevem na VRAM (primitivas, CLUT, uploads, transferencias) entram numa fila e sao
++// executados em ordem por uma thread trabalhadora; comandos que leem estado/VRAM esvaziam a fila antes.
++// Assim a thread do jogo (EE + VU1 + frontend do GS) segue produzindo enquanto a rasterizacao corre em
++// outro nucleo. PS2X_GS_THREAD=0 desliga (volta ao backend sincrono).
++// Faixas (FUNCOES.md #56): sequencias de primitivas com o mesmo scissor/FRAME/ZBUF sao desenhadas por
++// PS2X_GS_BANDS threads (padrao: nucleos - 2, max. 5), cada uma com o scissor cortado em fatias de linhas
++// intercaladas; cada pixel e sempre da mesma thread, entao a ordem por pixel e a do PS2. Qualquer outro
++// comando (CLUT, upload, TEXFLUSH, transferencia) funciona como barreira.
++
++#include "runtime/gs/gs_backend.h"
++#include "runtime/gs/gs_cpu_backend.h"
++
++#include <condition_variable>
++#include <cstddef>
++#include <deque>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++class GSThreadedBackend final : public GSRasterBackend
++{
++public:
++    explicit GSThreadedBackend(std::unique_ptr<GSCpuBackend> inner);
++    ~GSThreadedBackend() override;
++
++    void Initialize(uint8_t *vram, uint32_t vramSize) override;
++    void Reset() override;
++
++    void Submit(const GSPrimitiveBatch &batch) override;
++    void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override;
++    void BeginTransfer(const GSTransferCommand &command) override;
++    void UploadImage(const uint8_t *data, uint32_t sizeBytes) override;
++
++    void Flush() override;
++    void TextureFlush() override;
++    void Sync(GSSyncReason reason) override;
++    PresentationFrame Present(const GSPresentationRequest &request) override;
++
++    bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override;
++    uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override;
++
++    uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override;
++    void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override;
++    void SnapshotVram(std::vector<uint8_t> &out) const override;
++    GSTransferSnapshot GetTransferSnapshot() const override;
++
++    // true quando PS2X_GS_THREAD nao desliga o modo em thread
++    static bool EnabledByEnvironment();
++
++private:
++    enum class CommandType : uint8_t
++    {
++        Submit,
++        LoadClut,
++        BeginTransfer,
++        UploadImage,
++        TextureFlush,
++        WriteVram,
++    };
++
++    struct Command
++    {
++        CommandType type = CommandType::Submit;
++        GSPrimitiveBatch batch{};
++        GSTex0Reg tex0{};
++        GSTexClutReg texclut{};
++        GSTransferCommand transfer{};
++        std::vector<uint8_t> data;
++        uint32_t args[6] = {};
++    };
++
++    void Push(Command &&command);
++    void Drain() const;
++    void WorkerLoop();
++    void Execute(Command &command);
++    void DrawRun(std::vector<GSPrimitiveBatch> &run);
++    void BandLoop(uint32_t band);
++
++    std::unique_ptr<GSCpuBackend> m_inner;
++
++    // Pool de faixas
++    uint32_t m_bandCount = 1;
++    std::vector<std::thread> m_bandThreads;
++    std::mutex m_bandMutex;
++    std::condition_variable m_bandStart;
++    std::condition_variable m_bandDone;
++    const std::vector<GSPrimitiveBatch> *m_bandRun = nullptr;
++    uint64_t m_bandGeneration = 0;
++    uint32_t m_bandRemaining = 0;
++    bool m_bandStop = false;
++    mutable std::mutex m_queueMutex;
++    mutable std::condition_variable m_workAvailable;
++    mutable std::condition_variable m_idle;
++    mutable std::condition_variable m_spaceAvailable;
++    std::deque<Command> m_queue;
++    bool m_busy = false;
++    bool m_stop = false;
++    std::thread m_worker;
++};
+diff --git a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+index c289ba0..5d02e2e 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
++++ b/ps2xRuntime/src/lib/gs/ps2_gif_arbiter.cpp
+@@ -1,6 +1,7 @@
+ #include "runtime/gs/ps2_gif_arbiter.h"
+ #include <algorithm>
+ #include <cstring>
++#include "gs_parallel_bridge.h"
+ 
+ GifArbiter::GifArbiter(ProcessPacketFn processFn)
+     : m_processFn(std::move(processFn))
+@@ -56,6 +57,7 @@ void GifArbiter::drain()
+         auto &pkt = m_queue[i];
+         if (!pkt.data.empty())
+         {
++            ps2_gs_parallel::setCurrentPath(static_cast<uint32_t>(pkt.pathId));
+             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+         }
+     }
 diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
 index 8d46e03..e49b68c 100644
 --- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
@@ -2413,16 +3822,209 @@ index 37b6a4d..92318ad 100644
  void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
  {
      static constexpr uint32_t kDStat = 0x1000E010u;
+diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
+index 8590f14..c9e446f 100644
+--- a/ps2xRuntime/src/lib/ps2_pad.cpp
++++ b/ps2xRuntime/src/lib/ps2_pad.cpp
+@@ -1,6 +1,12 @@
+ #include "runtime/ps2_pad.h"
+ #include "ps2_host_backend.h"
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <mutex>
++#include <string>
+ 
+ namespace
+ {
+@@ -23,6 +29,115 @@ namespace
+     constexpr uint16_t PAD_L1 = 0x0400u;
+     constexpr uint16_t PAD_R2 = 0x0200u;
+     constexpr uint16_t PAD_L2 = 0x0100u;
++
++    // Mouse (FUNCOES.md #53): o movimento vira o analogico direito e os botoes/rodinha viram botoes do
++    // controle. A janela captura o cursor no primeiro clique; F2 (ou perder o foco) solta.
++    // PS2X_MOUSE=0 desliga; PS2X_MOUSE_SENS (padrao 6, unidades do analogico por pixel);
++    // PS2X_MOUSE_LEFT/RIGHT/MIDDLE/WHEEL = L1 R1 L2 R2 L3 R3 CROSS CIRCLE SQUARE TRIANGLE START SELECT NONE;
++    // PS2X_MOUSE_INVERT_Y=1 inverte o eixo vertical.
++    uint16_t parseButton(const char *env, uint16_t fallback)
++    {
++        const char *v = std::getenv(env);
++        if (!v || !*v)
++            return fallback;
++        std::string n(v);
++        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++        const struct { const char *name; uint16_t mask; } table[] = {
++            {"L1", PAD_L1}, {"R1", PAD_R1}, {"L2", PAD_L2}, {"R2", PAD_R2}, {"L3", PAD_L3}, {"R3", PAD_R3},
++            {"CROSS", PAD_CROSS}, {"X", PAD_CROSS}, {"CIRCLE", PAD_CIRCLE}, {"SQUARE", PAD_SQUARE},
++            {"TRIANGLE", PAD_TRIANGLE}, {"START", PAD_START}, {"SELECT", PAD_SELECT}, {"NONE", 0u}};
++        for (const auto &e : table)
++            if (n == e.name)
++                return e.mask;
++        return fallback;
++    }
++
++    struct MouseConfig
++    {
++        bool enabled = true;
++        float sens = 6.0f;
++        bool invertY = false;
++        uint16_t left = PAD_R1;   // atirar (hipotese: confirmar no tutorial do jogo)
++        uint16_t right = PAD_L1;  // mirar / travar alvo (hipotese)
++        uint16_t middle = PAD_R3;
++        uint16_t wheel = PAD_R3;  // zoom (hipotese)
++        MouseConfig()
++        {
++            if (const char *v = std::getenv("PS2X_MOUSE"))
++                enabled = std::atoi(v) != 0;
++            if (const char *v = std::getenv("PS2X_MOUSE_SENS"))
++                sens = static_cast<float>(std::atof(v));
++            if (const char *v = std::getenv("PS2X_MOUSE_INVERT_Y"))
++                invertY = std::atoi(v) != 0;
++            left = parseButton("PS2X_MOUSE_LEFT", left);
++            right = parseButton("PS2X_MOUSE_RIGHT", right);
++            middle = parseButton("PS2X_MOUSE_MIDDLE", middle);
++            wheel = parseButton("PS2X_MOUSE_WHEEL", wheel);
++        }
++    };
++
++    const MouseConfig &mouseConfig()
++    {
++        static const MouseConfig cfg;
++        return cfg;
++    }
++
++    // Preenchido pela thread da janela (ps2PadSampleHostInput) e consumido pela thread do jogo (readState).
++    struct MouseShared
++    {
++        std::mutex mutex;
++        bool captured = false;
++        float dx = 0.0f;
++        float dy = 0.0f;
++        uint16_t buttons = 0u; // mascara de botoes do controle pressionados pelo mouse
++        std::chrono::steady_clock::time_point wheelUntil{};
++    } g_mouse;
++}
++
++// Chamado uma vez por quadro do host, na thread da janela (as funcoes de entrada da raylib sao dela).
++void ps2PadSampleHostInput()
++{
++    const MouseConfig &cfg = mouseConfig();
++    if (!cfg.enabled)
++        return;
++    static bool captured = false;
++    if (captured && (IsKeyPressed(KEY_F2) || !IsWindowFocused()))
++    {
++        EnableCursor();
++        captured = false;
++    }
++    else if (!captured && IsWindowFocused() &&
++             (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)))
++    {
++        DisableCursor();
++        captured = true;
++        std::fprintf(stderr, "[pad] mouse capturado (F2 solta)\n");
++    }
++
++    std::lock_guard<std::mutex> lock(g_mouse.mutex);
++    g_mouse.captured = captured;
++    if (!captured)
++    {
++        g_mouse.dx = g_mouse.dy = 0.0f;
++        g_mouse.buttons = 0u;
++        return;
++    }
++    const Vector2 d = GetMouseDelta();
++    g_mouse.dx += d.x;
++    g_mouse.dy += cfg.invertY ? -d.y : d.y;
++    uint16_t b = 0u;
++    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
++        b |= cfg.left;
++    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
++        b |= cfg.right;
++    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
++        b |= cfg.middle;
++    const auto now = std::chrono::steady_clock::now();
++    if (GetMouseWheelMove() != 0.0f)
++        g_mouse.wheelUntil = now + std::chrono::milliseconds(200); // o jogo le o controle a poucos qps: segura o botao
++    if (now < g_mouse.wheelUntil)
++        b |= cfg.wheel;
++    g_mouse.buttons = b;
+ }
+ 
+ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+@@ -89,14 +204,26 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+     }
+     else
+     {
+-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
++        // Setas = direcional; WASD = analogico esquerdo (o jogo anda pelo analogico) (FUNCOES.md #53)
++        if (IsKeyDown(KEY_UP))
+             clearBit(PAD_UP);
+-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
++        if (IsKeyDown(KEY_DOWN))
+             clearBit(PAD_DOWN);
+-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
++        if (IsKeyDown(KEY_LEFT))
+             clearBit(PAD_LEFT);
+-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
++        if (IsKeyDown(KEY_RIGHT))
+             clearBit(PAD_RIGHT);
++        int lx = 0, ly = 0;
++        if (IsKeyDown(KEY_A))
++            lx -= 127;
++        if (IsKeyDown(KEY_D))
++            lx += 127;
++        if (IsKeyDown(KEY_W))
++            ly -= 127;
++        if (IsKeyDown(KEY_S))
++            ly += 127;
++        data[6] = static_cast<uint8_t>(128 + lx);
++        data[7] = static_cast<uint8_t>(128 + ly);
+         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+             clearBit(PAD_CROSS);
+         if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+@@ -117,6 +244,27 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+             clearBit(PAD_START);
+         if (IsKeyDown(KEY_TAB))
+             clearBit(PAD_SELECT);
++        // Cliques dos analogicos (zoom/Dead Eye usam R3/L3 em varios jogos)
++        if (IsKeyDown(KEY_R))
++            clearBit(PAD_R3);
++        if (IsKeyDown(KEY_F))
++            clearBit(PAD_L3);
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(g_mouse.mutex);
++        if (g_mouse.captured)
++        {
++            const MouseConfig &cfg = mouseConfig();
++            auto addAxis = [&cfg](uint8_t current, float delta) {
++                const int v = static_cast<int>(current) + static_cast<int>(delta * cfg.sens);
++                return static_cast<uint8_t>(std::clamp(v, 0, 255));
++            };
++            data[4] = addAxis(data[4], g_mouse.dx);
++            data[5] = addAxis(data[5], g_mouse.dy);
++            g_mouse.dx = g_mouse.dy = 0.0f;
++            btns &= static_cast<uint16_t>(~g_mouse.buttons);
++        }
+     }
+ 
+     data[2] = static_cast<uint8_t>(btns & 0xFF);
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..ed0eb91 100644
+index 45cb9d2..c3d504e 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
++#include "gs/gs_parallel_bridge.h"
 +#include "runtime/gs/gs_draw_stats.h"
  #include "ps2_runtime.h"
  #include "ps2_log.h"
  #include "ps2_stubs.h"
-@@ -19,6 +20,8 @@
+@@ -19,6 +21,8 @@
  #include <fstream>
  #include <algorithm>
  #include <array>
@@ -2431,7 +4033,7 @@ index 45cb9d2..ed0eb91 100644
  #include <cstring>
  #include <limits>
  #include <chrono>
-@@ -37,6 +40,62 @@ namespace ps2_stubs
+@@ -37,6 +41,64 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -2457,6 +4059,8 @@ index 45cb9d2..ed0eb91 100644
 +        }
 +    } g_guestWriteWatchInit;
 +}
++
++void ps2PadSampleHostInput(); // ps2_pad.cpp
 +
 +void ps2ReportGuestWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const char *op,
 +                         const R5900Context *ctx)
@@ -2494,7 +4098,40 @@ index 45cb9d2..ed0eb91 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -665,6 +724,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -388,13 +450,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+ 
+     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
+-    if (needsLatch)
++    // GS na GPU (paraLLEl-GS, FUNCOES.md #65): o scanout vem da imagem do VBlank
++    const bool gpuGs = ps2_gs_parallel::active();
++    if (needsLatch && !gpuGs)
+     {
+         rt->gs().latchHostPresentationFrame();
+         s_lastPresentationTick = currentTick;
+         s_hasLatchedInitialFrame = true;
+     }
+-    else if (s_hasUploadedFrame)
++    else if (!needsLatch && s_hasUploadedFrame)
+     {
+         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
+         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
+@@ -407,7 +471,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+     uint32_t displayFbp = 0u;
+     uint32_t sourceFbp = 0u;
+     bool usedPreferredDisplaySource = false;
+-    if (!rt->gs().copyLatchedHostPresentationFrame(s_scratch,
++    if (gpuGs && needsLatch)
++    {
++        s_lastPresentationTick = currentTick;
++        s_hasLatchedInitialFrame = true;
++    }
++    if (gpuGs ? !ps2_gs_parallel::present(rt->memory().gs(), static_cast<uint32_t>(currentTick & 1u), s_scratch, width, height)
++              : !rt->gs().copyLatchedHostPresentationFrame(s_scratch,
+                                                    width,
+                                                    height,
+                                                    &displayFbp,
+@@ -665,6 +735,8 @@ bool PS2Runtime::syncCoreSubsystems()
      }
  
      m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
@@ -2503,7 +4140,7 @@ index 45cb9d2..ed0eb91 100644
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
-@@ -732,7 +793,20 @@ bool PS2Runtime::initialize(const char *title)
+@@ -732,11 +804,27 @@ bool PS2Runtime::initialize(const char *title)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
          SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -2525,7 +4162,14 @@ index 45cb9d2..ed0eb91 100644
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
  #endif
-@@ -2388,6 +2462,63 @@ void PS2Runtime::run()
+         SetTargetFPS(60);
++        // Esc e o botao Circulo no teclado (ps2_pad.cpp); sem isto a raylib fecha a janela ao apertar Esc
++        // (o jogo "fechava sozinho" no tutorial, FUNCOES.md #54). Fechar: botao X da janela ou Alt+F4.
++        SetExitKey(KEY_NULL);
+         if (m_debugUiInitCallback)
+         {
+             m_debugUiInitCallback(*this, m_debugUiUserData);
+@@ -2388,6 +2476,63 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -2589,7 +4233,7 @@ index 45cb9d2..ed0eb91 100644
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
              if ((tick % 120) == 0)
-@@ -2410,6 +2541,9 @@ void PS2Runtime::run()
+@@ -2410,6 +2555,9 @@ void PS2Runtime::run()
                                                 << " gp=0x" << dbgGp
                                                 << " dispfb1=0x" << gs.dispfb1
                                                 << " display1=0x" << gs.display1
@@ -2599,7 +4243,7 @@ index 45cb9d2..ed0eb91 100644
                                                 << std::dec
                                                 << " activeThreads=" << eeSnapshot.threads.size()
                                                 << " dma=" << curDma
-@@ -2417,6 +2551,49 @@ void PS2Runtime::run()
+@@ -2417,6 +2565,49 @@ void PS2Runtime::run()
                                                 << " gsw=" << curGs
                                                 << " vif=" << curVif
                                                 << std::endl);
@@ -2649,10 +4293,12 @@ index 45cb9d2..ed0eb91 100644
  
              }
          });
-@@ -2424,6 +2601,37 @@ void PS2Runtime::run()
+@@ -2424,6 +2615,39 @@ void PS2Runtime::run()
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
  
++        ps2PadSampleHostInput(); // mouse -> controle (ps2_pad.cpp, FUNCOES.md #53)
++
 +        if (IsKeyPressed(KEY_F9))
 +        {
 +            // Debug: registra as proximas primitivas do GS ([gs:trace]).
@@ -2688,16 +4334,20 @@ index 45cb9d2..ed0eb91 100644
          ClearBackground(BLACK);
          const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index b02c7ca..72fdaed 100644
+index b02c7ca..c638587 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,9 @@
  // Based on Blackline Interactive implementation
++#include <cstdlib>
++#include <cstdio>
++#include <unordered_set>
++#include <mutex>
 +#include "runtime/gs/gs_draw_stats.h"
  #include "runtime/ps2_memory.h"
  #include <cstring>
  
-@@ -300,37 +301,81 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -300,37 +305,81 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
      if (sizeBytes == 0u)
          return;
  
@@ -2791,7 +4441,7 @@ index b02c7ca..72fdaed 100644
          uint32_t cmd;
          memcpy(&cmd, data + pos, 4);
          pos += 4;
-@@ -402,6 +447,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -402,6 +451,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          }
          else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
          {
@@ -2799,7 +4449,7 @@ index b02c7ca..72fdaed 100644
              uint32_t startPC = (uint32_t)imm * 8u;
  
              const uint32_t runTop = vif1_regs.tops & 0x3FFu;
-@@ -422,6 +468,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -422,6 +472,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          }
          else if (opcode == VIF_MSCNT)
          {
@@ -2807,7 +4457,7 @@ index b02c7ca..72fdaed 100644
              const uint32_t runTop = vif1_regs.tops & 0x3FFu;
              const uint32_t runItop = vif1_regs.itops & 0x3FFu;
              vif1_regs.top = runTop;
-@@ -441,7 +488,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -441,7 +492,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          else if (opcode == VIF_STMASK)
          {
              if (pos + 4 > sizeBytes)
@@ -2819,7 +4469,7 @@ index b02c7ca..72fdaed 100644
              uint32_t maskValue = 0;
              std::memcpy(&maskValue, data + pos, sizeof(maskValue));
              vif1_regs.mask = maskValue;
-@@ -451,7 +501,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -451,7 +505,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          else if (opcode == VIF_STROW)
          {
              if (pos + 16 > sizeBytes)
@@ -2831,7 +4481,7 @@ index b02c7ca..72fdaed 100644
              std::memcpy(vif1_regs.row, data + pos, 16);
              pos += 16;
              continue;
-@@ -459,16 +512,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -459,16 +516,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          else if (opcode == VIF_STCOL)
          {
              if (pos + 16 > sizeBytes)
@@ -2858,7 +4508,40 @@ index b02c7ca..72fdaed 100644
              if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
              {
                  uint32_t copyBytes = mpgBytes;
-@@ -487,6 +549,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -478,6 +544,32 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                 {
+                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                     markVU1CodeModified();
++                    // Debug (FUNCOES.md #60): PS2X_VU1_DUMP_MPG=<pasta> grava cada microprograma novo do VU1
++                    // (mpg_<destino>_<bytes>_<hash>.bin) para medir quantos programas o jogo usa.
++                    static const char *s_mpgDir = std::getenv("PS2X_VU1_DUMP_MPG");
++                    if (s_mpgDir)
++                    {
++                        static std::mutex s_mpgMutex;
++                        static std::unordered_set<uint64_t> s_mpgSeen;
++                        uint64_t hash = 1469598103934665603ull;
++                        for (uint32_t b = 0; b < copyBytes; ++b)
++                            hash = (hash ^ data[pos + b]) * 1099511628211ull;
++                        hash ^= static_cast<uint64_t>(destAddr) << 40;
++                        std::lock_guard<std::mutex> lock(s_mpgMutex);
++                        if (s_mpgSeen.insert(hash).second)
++                        {
++                            char name[512];
++                            std::snprintf(name, sizeof(name), "%s/mpg_%04x_%u_%016llx.bin", s_mpgDir, destAddr, copyBytes,
++                                          static_cast<unsigned long long>(hash));
++                            if (std::FILE *f = std::fopen(name, "wb"))
++                            {
++                                std::fwrite(data + pos, 1, copyBytes, f);
++                                std::fclose(f);
++                            }
++                            std::fprintf(stderr, "[vu1-mpg] novo programa dest=0x%04x bytes=%u hash=%016llx total=%zu\n",
++                                         destAddr, copyBytes, static_cast<unsigned long long>(hash), s_mpgSeen.size());
++                        }
++                    }
+                 }
+             }
+             pos += mpgBytes;
+@@ -487,6 +579,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
          }
          else if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
          {
@@ -2866,7 +4549,7 @@ index b02c7ca..72fdaed 100644
              uint32_t qwCount = imm;
              if (qwCount == 0)
                  qwCount = 65536;
-@@ -495,29 +558,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -495,29 +588,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              if (qwCount > availableQw)
                  qwCount = availableQw;
  
@@ -2903,7 +4586,7 @@ index b02c7ca..72fdaed 100644
              uint8_t vn = (opcode >> 2) & 0x3;
              uint8_t vl = opcode & 0x3;
              const bool maskEnable = (opcode & 0x10u) != 0u;
-@@ -572,6 +631,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -572,6 +661,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
  
              const bool zeroExtend = (imm & 0x4000u) != 0u;
  
@@ -2916,7 +4599,7 @@ index b02c7ca..72fdaed 100644
              if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
              {
                  const uint8_t *srcBase = data + pos;
-@@ -780,4 +845,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -780,4 +875,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
              continue;
          }
      }
@@ -2924,11 +4607,742 @@ index b02c7ca..72fdaed 100644
 +    // Partial VIFcode or DIRECT tail shorter than a quadword: keep it for the next transfer.
 +    carryFrom(pos);
  }
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.cpp
+new file mode 100644
+index 0000000..cf5543c
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.cpp
+@@ -0,0 +1,198 @@
++#include "ps2_vu1_compiled.h"
++
++#include "runtime/ps2_memory.h"
++#include "runtime/gs/gs_draw_stats.h"
++
++#include <cfenv>
++#include <cstdio>
++#include <cstdlib>
++#include <memory>
++#include <mutex>
++#include <vector>
++
++// Registro e despachante dos microprogramas recompilados do VU1 (FUNCOES.md #61).
++// PS2X_VU1_COMPILED=0 desliga. PS2X_VU1_COMPILED_VERIFY=<n> roda tambem o interpretador numa copia para as
++// n primeiras execucoes de cada programa e compara o estado final (VF/VI/ACC/Q/P/I/MAC/clip/status/PC e memoria de dados).
++
++namespace
++{
++    struct Program
++    {
++        uint32_t start;
++        uint32_t bytes;
++        uint64_t hash;
++        Vu1Compiled::Fn fn;
++        const char *name;
++        uint64_t checkedGeneration = UINT64_MAX;
++        bool matches = false;
++        long verified = 0; // execucoes ja comparadas com o interpretador (PS2X_VU1_COMPILED_VERIFY por programa)
++    };
++
++    std::vector<Program> &registry()
++    {
++        static std::vector<Program> programs;
++        return programs;
++    }
++
++    uint64_t hashBytes(const uint8_t *data, uint32_t bytes)
++    {
++        uint64_t hash = 1469598103934665603ull;
++        for (uint32_t i = 0; i < bytes; ++i)
++            hash = (hash ^ data[i]) * 1099511628211ull;
++        return hash;
++    }
++
++    bool compiledEnabled()
++    {
++        static const bool enabled = []() {
++            const char *v = std::getenv("PS2X_VU1_COMPILED");
++            return !v || std::atoi(v) != 0;
++        }();
++        return enabled;
++    }
++
++    long verifyBudget()
++    {
++        static long budget = []() {
++            const char *v = std::getenv("PS2X_VU1_COMPILED_VERIFY");
++            return v ? std::atol(v) : 0L;
++        }();
++        return budget;
++    }
++
++    // Programa registrado que contem `pc` e cujo codigo bate com a memoria atual do VU1
++    Program *findProgram(uint32_t pc, const uint8_t *code, uint32_t codeSize, uint64_t generation)
++    {
++        for (Program &p : registry())
++        {
++            if (pc < p.start || pc >= p.start + p.bytes || p.start + p.bytes > codeSize)
++                continue;
++            if (p.checkedGeneration != generation)
++            {
++                // hash do conteudo + destino, igual ao do PS2X_VU1_DUMP_MPG / tools/vu1_recomp.py
++                p.matches = (hashBytes(code + p.start, p.bytes) ^ (static_cast<uint64_t>(p.start) << 40)) == p.hash;
++                p.checkedGeneration = generation;
++            }
++            if (p.matches)
++                return &p;
++        }
++        return nullptr;
++    }
++}
++
++void Vu1Compiled::registerProgram(uint32_t start, uint32_t bytes, uint64_t hash, Fn fn, const char *name)
++{
++    registry().push_back(Program{start, bytes, hash, fn, name});
++}
++
++bool Vu1Compiled::tryRun(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
++                         GS &gs, PS2Memory *memory, uint32_t maxCycles)
++{
++    if (vu.m_unit != VU1Interpreter::Unit::VU1 || !memory || registry().empty() || !compiledEnabled() ||
++        !vu1FastFmacEnabled() || !vu1FastMathEnabled())
++        return false;
++    if (code != memory->getVU1Code())
++        return false;
++    const uint64_t generation = memory->getVU1CodeGeneration();
++    Program *program = findProgram(vu.m_state.pc, code, codeSize, generation);
++    if (!program)
++        return false;
++
++    // Verificacao: copia do interpretador + memoria de dados antes de rodar
++    std::unique_ptr<VU1Interpreter> reference;
++    std::vector<uint8_t> referenceData;
++    const bool verify = program->verified < verifyBudget();
++    if (verify)
++    {
++        ++program->verified;
++        reference = std::make_unique<VU1Interpreter>(vu);
++        referenceData.assign(data, data + dataSize);
++    }
++    const uint32_t startPc = vu.m_state.pc;
++    const char *startName = program->name;
++
++    // Prologo de run()
++    vu.m_activeVuData = data;
++    vu.m_activeVuDataSize = dataSize;
++    vu.m_activeGs = &gs;
++    vu.m_activeMemory = memory;
++    // garante o cache de decodificacao valido para esta geracao do codigo
++    (void)vu.getDecodedInstructionPairForPc(code, codeSize, memory, vu.m_state.pc);
++
++    const int previousRoundingMode = std::fegetround();
++    const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
++
++    Env env{code, codeSize, data, dataSize, &gs, memory};
++    int status = kExited;
++    while (program)
++    {
++        status = program->fn(vu, env, vu.m_state.pc);
++        if (status != kExited)
++            break;
++        program = findProgram(vu.m_state.pc, code, codeSize, generation);
++    }
++
++    if (useVuRounding && previousRoundingMode != -1)
++        std::fesetround(previousRoundingMode);
++
++    if (status == kExited)
++    {
++        // Saiu para codigo nao compilado: o interpretador continua dali
++        vu.run(code, codeSize, data, dataSize, gs, memory, maxCycles);
++    }
++    else
++    {
++        // Epilogo de run()
++        if (ps2_gs_stats::statsEnabled())
++            ps2_gs_stats::countEvent(status == kEnded ? "vu1.end.ebit" : "vu1.end.other");
++        if (status == kEnded)
++        {
++            vu.flushPipelines();
++            vu.m_state.ebit = false;
++            vu.m_state.haltAfterDelaySlot = false;
++            vu.m_pendingHaltD = false;
++            vu.m_pendingHaltT = false;
++        }
++        vu.m_state.cycles = vu.m_cycle;
++    }
++    if (ps2_gs_stats::statsEnabled())
++        ps2_gs_stats::countEvent("vu1.compiled");
++
++    if (verify)
++    {
++        // O interpretador de referencia roda numa copia da memoria de dados; os XGKICKs dele nao vao ao GS.
++        std::vector<uint8_t> compiledData(data, data + dataSize);
++        reference->m_activeMemory = nullptr;
++        reference->m_activeGs = nullptr;
++        reference->run(code, codeSize, referenceData.data(), dataSize, gs, nullptr, maxCycles);
++        const VU1State &a = vu.m_state;
++        const VU1State &b = reference->m_state;
++        bool same = std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 && std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
++                    std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0 && a.q == b.q && a.p == b.p && a.i == b.i &&
++                    a.mac == b.mac && a.clip == b.clip && a.status == b.status && a.pc == b.pc &&
++                    std::memcmp(compiledData.data(), referenceData.data(), dataSize) == 0;
++        std::fprintf(stderr, "[vu1-compiled] verify %s start=0x%04x prog=%s cycles=%llu/%llu%s\n", same ? "OK" : "DIFERENTE",
++                     startPc, startName, static_cast<unsigned long long>(vu.m_cycle),
++                     static_cast<unsigned long long>(reference->m_cycle), same ? "" : " <<<");
++        if (!same)
++        {
++            for (int r = 0; r < 32; ++r)
++                if (std::memcmp(a.vf[r], b.vf[r], 16) != 0)
++                    std::fprintf(stderr, "  vf%d %g,%g,%g,%g vs %g,%g,%g,%g\n", r, a.vf[r][0], a.vf[r][1], a.vf[r][2],
++                                 a.vf[r][3], b.vf[r][0], b.vf[r][1], b.vf[r][2], b.vf[r][3]);
++            for (int r = 0; r < 16; ++r)
++                if (a.vi[r] != b.vi[r])
++                    std::fprintf(stderr, "  vi%d %d vs %d\n", r, a.vi[r], b.vi[r]);
++            if (a.mac != b.mac || a.clip != b.clip || a.status != b.status || a.pc != b.pc)
++                std::fprintf(stderr, "  mac %x/%x clip %x/%x status %x/%x pc %x/%x\n", a.mac, b.mac, a.clip, b.clip,
++                             a.status, b.status, a.pc, b.pc);
++            for (uint32_t off = 0; off < dataSize; off += 16)
++                if (std::memcmp(compiledData.data() + off, referenceData.data() + off, 16) != 0)
++                {
++                    std::fprintf(stderr, "  data qw 0x%x difere\n", off / 16);
++                    break;
++                }
++        }
++    }
++    return true;
++}
+diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.h b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.h
+new file mode 100644
+index 0000000..2964c9e
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vu/ps2_vu1_compiled.h
+@@ -0,0 +1,519 @@
++#pragma once
++
++// Microprogramas do VU1 recompilados (FUNCOES.md #61).
++//
++// Um gerador (tools/vu1_recomp.py do projeto) le os microprogramas enviados por VIF MPG e emite, para
++// cada programa, uma funcao com um rotulo por par de instrucoes que chama Vu1Compiled::pair<UPPER, LOWER>.
++// pair() reproduz exatamente uma iteracao de VU1Interpreter::run() no modo rapido (PS2X_VU1_FAST e
++// PS2X_VU1_FAST_MATH ligados): commit dos pipelines, espera por VI/FDIV/EFU/WAITQ/WAITP/XGKICK, bit I,
++// sombra de VF entre upper e lower, escrita atrasada de VI, regra do VI antigo nos desvios, vf0/vi0,
++// avanco de PC, D/T/E e advanceOneCycle(). As instrucoes frequentes sao resolvidas em tempo de compilacao
++// (if constexpr sobre a palavra da instrucao); as demais caem em execUpper/execLower do interpretador.
++// Assim o resultado e identico ao do interpretador e so some o custo de buscar/decodificar/despachar.
++
++#include "runtime/ps2_vu1.h"
++#include "ps2_vu1_fast.h"
++
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++class GS;
++class PS2Memory;
++
++bool vu1FastFmacEnabled();
++bool vu1FastMathEnabled();
++
++struct Vu1Compiled
++{
++    struct Env
++    {
++        uint8_t *code;
++        uint32_t codeSize;
++        uint8_t *data;
++        uint32_t dataSize;
++        GS *gs;
++        PS2Memory *memory;
++    };
++
++    // Retorno das funcoes geradas
++    static constexpr int kEnded = 0;  // programa terminou (E-bit, D/T, etc.)
++    static constexpr int kExited = 1; // saiu para um PC fora do programa: m_state.pc tem o destino
++    static constexpr int kStopped = 2; // m_stopRequested (instrucao reservada)
++
++    using Fn = int (*)(VU1Interpreter &vu, Env &env, uint32_t pc);
++
++    // Registro (feito por inicializadores estaticos do codigo gerado)
++    static void registerProgram(uint32_t start, uint32_t bytes, uint64_t hash, Fn fn, const char *name);
++
++    // Chamado por VU1Interpreter::execute(); true = programa executado (compilado e/ou interpretado).
++    static bool tryRun(VU1Interpreter &vu, uint8_t *code, uint32_t codeSize, uint8_t *data, uint32_t dataSize,
++                       GS &gs, PS2Memory *memory, uint32_t maxCycles);
++
++    // ------------------------------------------------------------------------------------------------
++    // Uma iteracao do laco de run() para o par em `pc`. Retorna -1 para continuar (nextPc preenchido)
++    // ou kEnded/kStopped.
++    template <uint32_t U, uint32_t L>
++    static inline int pair(VU1Interpreter &vu, Env &env, uint32_t pc, uint32_t &nextPc)
++    {
++        VU1State &s = vu.m_state;
++        s.pc = pc;
++        if (vu.m_cycle >= vu.m_nextCommitCycle)
++            vu.commitReadyPipelines();
++
++        const VU1Interpreter::DecodedInstructionPair &d = vu.m_decodedCodeCache[pc >> 3];
++
++        // Espera (no modo rapido VF/ACC nunca esperam; sobram VI, FDIV, EFU, WAITQ/WAITP e XGKICK)
++        uint64_t ready = readyCycle(vu, d);
++        while (ready > vu.m_cycle)
++        {
++            vu.advanceTo(ready);
++            ready = readyCycle(vu, d);
++        }
++
++        uint8_t writtenVi = 0u;
++        int32_t oldVi = 0;
++        if (const uint32_t viw = static_cast<uint32_t>(d.lowerUsage.viWrite) & 0xFFFEu)
++        {
++            writtenVi = static_cast<uint8_t>(std::countr_zero(viw));
++            oldVi = s.vi[writtenVi];
++        }
++
++        constexpr bool kIBit = (U & 0x80000000u) != 0u;
++        if constexpr (kIBit)
++        {
++            upper<U>(vu);
++            float immediate;
++            const uint32_t bits = L;
++            std::memcpy(&immediate, &bits, sizeof(immediate));
++            s.i = vuNormalizeOperandFast(immediate);
++        }
++        else if (d.upperVfShadowReg != 0u)
++        {
++            float oldVf[4];
++            float upperVf[4];
++            std::memcpy(oldVf, s.vf[d.upperVfShadowReg], sizeof(oldVf));
++            upper<U>(vu);
++            std::memcpy(upperVf, s.vf[d.upperVfShadowReg], sizeof(upperVf));
++            std::memcpy(s.vf[d.upperVfShadowReg], oldVf, sizeof(oldVf));
++            lower<U, L>(vu, env);
++            std::memcpy(s.vf[d.upperVfShadowReg], upperVf, sizeof(upperVf));
++        }
++        else
++        {
++            upper<U>(vu);
++            lower<U, L>(vu, env);
++        }
++
++        vu.m_viBranchBackupValid = false;
++        if (writtenVi != 0u)
++        {
++            const int32_t newVi = s.vi[writtenVi];
++            s.vi[writtenVi] = oldVi;
++            const uint32_t latency = d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency;
++            vu.queueViWrite(writtenVi, newVi, latency);
++        }
++        // markPairWrites no modo rapido: so o VI marca prontidao
++        for (uint32_t bits = static_cast<uint32_t>(d.lowerUsage.viWrite) & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++            vu.m_viReady[static_cast<uint32_t>(std::countr_zero(bits))] =
++                vu.m_cycle + (d.lowerUsage.viLatency != 0u ? d.lowerUsage.viLatency : d.lowerUsage.latency);
++        if (writtenVi != 0u && d.lowerUsage.delaysNextBranchRead)
++            vu.recordViWriteForBranch(writtenVi, oldVi);
++
++        s.vf[0][0] = 0.0f;
++        s.vf[0][1] = 0.0f;
++        s.vf[0][2] = 0.0f;
++        s.vf[0][3] = 1.0f;
++        s.vi[0] = 0;
++
++        uint32_t np = pc + 8u;
++        if (np >= env.codeSize)
++            np = 0u;
++        if (s.branchPending)
++        {
++            if (s.branchDelay == 0u)
++            {
++                np = s.branchTarget & 0x3FFFu;
++                s.branchPending = false;
++            }
++            else
++                --s.branchDelay;
++        }
++        s.pc = np;
++        nextPc = np;
++
++        // Bits D/T/E (mesma ordem de run())
++        constexpr bool kE = (U & 0x40000000u) != 0u;
++        constexpr bool kD = (U & 0x10000000u) != 0u;
++        constexpr bool kT = (U & 0x08000000u) != 0u;
++        bool programEnded = false;
++        const bool dHalt = kD && s.dBitEnabled;
++        const bool tHalt = kT && s.tBitEnabled;
++        const bool haltBit = dHalt || tHalt;
++        const bool haltBranch = haltBit && d.lowerUsage.pipeline == VU1Interpreter::PipelineBranch;
++        if (s.haltAfterDelaySlot)
++        {
++            s.stoppedByD = vu.m_pendingHaltD;
++            s.stoppedByT = vu.m_pendingHaltT;
++            programEnded = true;
++        }
++        else if (s.ebit)
++            programEnded = true;
++        else if (haltBit && !haltBranch)
++        {
++            s.stoppedByD = dHalt;
++            s.stoppedByT = tHalt;
++            programEnded = true;
++        }
++        else if (kE)
++            s.ebit = true;
++        else if (haltBranch)
++        {
++            s.haltAfterDelaySlot = true;
++            vu.m_pendingHaltD = dHalt;
++            vu.m_pendingHaltT = tHalt;
++        }
++
++        advanceOneCycle(vu);
++        if (vu.m_stopRequested)
++            return kStopped;
++        return programEnded ? kEnded : -1;
++    }
++
++private:
++    static inline uint64_t readyCycle(const VU1Interpreter &vu, const VU1Interpreter::DecodedInstructionPair &d)
++    {
++        uint64_t ready = vu.m_cycle;
++        for (uint32_t bits = (static_cast<uint32_t>(d.upperUsage.viRead) | d.lowerUsage.viRead) & 0xFFFEu; bits != 0u;
++             bits &= bits - 1u)
++        {
++            const uint64_t r = vu.m_viReady[static_cast<uint32_t>(std::countr_zero(bits))];
++            if (r > ready)
++                ready = r;
++        }
++        const auto &lu = d.lowerUsage;
++        if ((lu.pipeline == VU1Interpreter::PipelineFdiv || lu.waitQ) && vu.m_fdiv.valid && vu.m_fdiv.readyCycle > ready)
++            ready = vu.m_fdiv.readyCycle;
++        if (lu.pipeline == VU1Interpreter::PipelineEfu && vu.m_efuResourceReady > ready)
++            ready = vu.m_efuResourceReady;
++        if (lu.waitP)
++            for (const auto &entry : vu.m_efu)
++                if (entry.valid && entry.readyCycle > ready)
++                    ready = entry.readyCycle;
++        if (lu.pipeline == VU1Interpreter::PipelineXgkick && vu.m_xgkick.active && vu.m_cycle + 1u > ready)
++            ready = vu.m_cycle + 1u;
++        return ready;
++    }
++
++    // ---- upper (FMAC) ---------------------------------------------------------------------------
++    static constexpr uint8_t laneBit(uint32_t c) { return static_cast<uint8_t>(8u >> c); }
++
++    // applyFmacDest no modo de matematica rapida: normaliza cada lane do dest, enfileira as flags e grava
++    static inline void fmacStore(VU1Interpreter &vu, float *dst, float *result, uint8_t dest)
++    {
++        uint8_t laneFlags[4] = {0, 0, 0, 0};
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            if ((dest & laneBit(c)) == 0u)
++                continue;
++            uint32_t flags = 0u;
++            result[c] = vu.normalizeResult(result[c], flags);
++            laneFlags[c] = static_cast<uint8_t>(flags);
++        }
++        fmacFlags(vu, laneFlags, dest);
++        for (uint32_t c = 0; c < 4u; ++c)
++            if (dest & laneBit(c))
++                dst[c] = result[c];
++    }
++
++    // updateFmacFlags (extraSticky = 0) inline: slot livre achado pela mascara de ocupados
++    static inline void fmacFlags(VU1Interpreter &vu, const uint8_t laneFlags[4], uint8_t dest)
++    {
++        if (dest == 0u)
++            return;
++        uint32_t mac = 0u;
++        uint32_t status = 0u;
++        for (uint32_t c = 0; c < 4u; ++c)
++        {
++            const uint32_t lane = laneBit(c);
++            if ((dest & lane) == 0u)
++                continue;
++            const uint32_t flags = laneFlags[c];
++            if (flags & 0x1u) mac |= lane;
++            if (flags & 0x2u) mac |= lane << 4;
++            if (flags & 0x4u) mac |= lane << 8;
++            if (flags & 0x8u) mac |= lane << 12;
++            status |= flags;
++        }
++        const uint32_t freeMask = ~vu.m_flagValidMask & ((1u << VU1Interpreter::kMaxFlagEntries) - 1u);
++        if (freeMask == 0u)
++        {
++            vu.updateFmacFlags(laneFlags, dest, 0u); // caminho original (reporta estouro)
++            return;
++        }
++        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(freeMask));
++        auto &entry = vu.m_flagPipeline[slot];
++        entry = {};
++        entry.valid = true;
++        vu.m_flagValidMask |= 1u << slot;
++        entry.issueCycle = vu.m_cycle;
++        entry.readyCycle = vu.m_cycle + VU1Interpreter::kFmacLatency;
++        if (entry.readyCycle < vu.m_nextCommitCycle)
++            vu.m_nextCommitCycle = entry.readyCycle;
++        entry.mac = mac;
++        entry.status = status;
++        entry.writesMac = true;
++        entry.writesStatus = true;
++    }
++
++    // advanceOneCycle inline (commit so quando algo fica pronto; XGKICK so se ativo)
++    static inline void advanceOneCycle(VU1Interpreter &vu)
++    {
++        ++vu.m_cycle;
++        vu.m_state.cycles = vu.m_cycle;
++        if (vu.m_cycle >= vu.m_nextCommitCycle)
++            vu.commitReadyPipelines();
++        if (vu.m_xgkick.active)
++            vu.progressXgkick();
++    }
++
++    static inline void plainStore(float *dst, const float *result, uint8_t dest)
++    {
++        for (uint32_t c = 0; c < 4u; ++c)
++            if (dest & laneBit(c))
++                dst[c] = result[c];
++    }
++
++    template <uint32_t U>
++    static inline void upper(VU1Interpreter &vu)
++    {
++        constexpr uint32_t op = U & 0x3Fu;
++        constexpr uint8_t dest = static_cast<uint8_t>((U >> 21) & 0xFu);
++        constexpr uint8_t ft = static_cast<uint8_t>((U >> 16) & 0x1Fu);
++        constexpr uint8_t fs = static_cast<uint8_t>((U >> 11) & 0x1Fu);
++        constexpr uint8_t fd = static_cast<uint8_t>((U >> 6) & 0x1Fu);
++        constexpr uint32_t special = op >= 0x3Cu ? ((U & 3u) | ((U >> 4) & 0x7Cu)) : 0xFFu;
++        VU1State &s = vu.m_state;
++
++        if constexpr (op >= 0x3Cu && (special == 0x2Fu || special == 0x30u))
++        {
++            return; // NOP
++        }
++        else
++        {
++            vu.m_currentUpperInstruction = U;
++            float vs[4], vt[4], acc[4], result[4];
++            for (uint32_t c = 0; c < 4u; ++c)
++            {
++                vs[c] = vuNormalizeOperandFast(s.vf[fs][c]);
++                vt[c] = vuNormalizeOperandFast(s.vf[ft][c]);
++                acc[c] = vuNormalizeOperandFast(s.acc[c]);
++            }
++            const float q = vuNormalizeOperandFast(s.q);
++            const float i = vuNormalizeOperandFast(s.i);
++
++            if constexpr (op < 0x3Cu)
++            {
++                float *vd = s.vf[fd];
++                constexpr uint32_t bc = op & 3u;
++                if constexpr (op <= 0x03u)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + vt[bc];
++                    fmacStore(vu, vd, result, dest);
++                }
++                else if constexpr (op <= 0x07u)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - vt[bc];
++                    fmacStore(vu, vd, result, dest);
++                }
++                else if constexpr (op <= 0x0Bu)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * vt[bc];
++                    fmacStore(vu, vd, result, dest);
++                }
++                else if constexpr (op <= 0x0Fu)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * vt[bc];
++                    fmacStore(vu, vd, result, dest);
++                }
++                else if constexpr (op <= 0x13u)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = (vs[c] > vt[bc]) ? vs[c] : vt[bc];
++                    plainStore(vd, result, dest);
++                }
++                else if constexpr (op <= 0x17u)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = (vs[c] < vt[bc]) ? vs[c] : vt[bc];
++                    plainStore(vd, result, dest);
++                }
++                else if constexpr (op <= 0x1Bu)
++                {
++                    for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * vt[bc];
++                    fmacStore(vu, vd, result, dest);
++                }
++                else if constexpr (op == 0x1Cu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * q; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x1Du) { for (uint32_t c = 0; c < 4u; ++c) result[c] = (vs[c] > i) ? vs[c] : i; plainStore(vd, result, dest); }
++                else if constexpr (op == 0x1Eu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * i; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x1Fu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = (vs[c] < i) ? vs[c] : i; plainStore(vd, result, dest); }
++                else if constexpr (op == 0x20u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + q; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x21u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * q; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x22u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + i; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x23u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * i; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x24u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - q; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x25u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * q; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x26u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - i; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x27u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * i; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x28u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + vt[c]; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x29u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * vt[c]; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x2Au) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * vt[c]; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x2Bu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = (vs[c] > vt[c]) ? vs[c] : vt[c]; plainStore(vd, result, dest); }
++                else if constexpr (op == 0x2Cu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - vt[c]; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x2Du) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * vt[c]; fmacStore(vu, vd, result, dest); }
++                else if constexpr (op == 0x2Eu)
++                {
++                    result[0] = acc[0] - vs[1] * vt[2];
++                    result[1] = acc[1] - vs[2] * vt[0];
++                    result[2] = acc[2] - vs[0] * vt[1];
++                    result[3] = 0.0f;
++                    fmacStore(vu, vd, result, dest);
++                }
++                else if constexpr (op == 0x2Fu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = (vs[c] < vt[c]) ? vs[c] : vt[c]; plainStore(vd, result, dest); }
++                else
++                {
++                    vu.execUpper(U);
++                }
++            }
++            else
++            {
++                float *vtDest = s.vf[ft];
++                constexpr uint32_t bc = special & 3u;
++                if constexpr (special <= 0x03u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + vt[bc]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special <= 0x07u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - vt[bc]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special <= 0x0Bu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * vt[bc]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special <= 0x0Fu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * vt[bc]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special >= 0x10u && special <= 0x13u)
++                {
++                    constexpr float scale = special == 0x10u ? 1.0f : special == 0x11u ? 16.0f : special == 0x12u ? 4096.0f : 32768.0f;
++                    for (uint32_t c = 0; c < 4u; ++c)
++                    {
++                        int32_t iv;
++                        std::memcpy(&iv, &s.vf[fs][c], 4);
++                        result[c] = special == 0x10u ? static_cast<float>(iv) : static_cast<float>(iv) / scale;
++                    }
++                    plainStore(vtDest, result, dest);
++                }
++                else if constexpr (special >= 0x14u && special <= 0x17u)
++                {
++                    constexpr float scale = special == 0x14u ? 1.0f : special == 0x15u ? 16.0f : special == 0x16u ? 4096.0f : 32768.0f;
++                    for (uint32_t c = 0; c < 4u; ++c)
++                    {
++                        const double scaled = static_cast<double>(vs[c]) * static_cast<double>(scale);
++                        int32_t iv;
++                        if (scaled >= static_cast<double>(std::numeric_limits<int32_t>::max()))
++                            iv = std::numeric_limits<int32_t>::max();
++                        else if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
++                            iv = std::numeric_limits<int32_t>::min();
++                        else
++                            iv = static_cast<int32_t>(scaled);
++                        std::memcpy(&result[c], &iv, 4);
++                    }
++                    plainStore(vtDest, result, dest);
++                }
++                else if constexpr (special >= 0x18u && special <= 0x1Bu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * vt[bc]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x1Cu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * q; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x1Du) { for (uint32_t c = 0; c < 4u; ++c) result[c] = std::fabs(vs[c]); plainStore(vtDest, result, dest); }
++                else if constexpr (special == 0x1Eu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * i; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x20u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + q; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x21u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * q; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x22u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + i; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x23u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * i; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x24u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - q; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x25u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * q; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x26u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - i; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x27u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * i; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x28u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] + vt[c]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x29u) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] + vs[c] * vt[c]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x2Au) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] * vt[c]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x2Cu) { for (uint32_t c = 0; c < 4u; ++c) result[c] = vs[c] - vt[c]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x2Du) { for (uint32_t c = 0; c < 4u; ++c) result[c] = acc[c] - vs[c] * vt[c]; fmacStore(vu, s.acc, result, dest); }
++                else if constexpr (special == 0x2Eu)
++                {
++                    result[0] = vs[1] * vt[2];
++                    result[1] = vs[2] * vt[0];
++                    result[2] = vs[0] * vt[1];
++                    result[3] = 0.0f;
++                    fmacStore(vu, s.acc, result, dest);
++                }
++                else
++                {
++                    vu.execUpper(U); // CLIP e o resto: caminho do interpretador
++                }
++            }
++        }
++    }
++
++    // ---- lower ----------------------------------------------------------------------------------
++    template <uint32_t U, uint32_t L>
++    static inline void lower(VU1Interpreter &vu, Env &env)
++    {
++        constexpr uint32_t opHi = (L >> 25) & 0x7Fu;
++        VU1State &s = vu.m_state;
++        if constexpr (L == 0x00000000u || L == 0x8000033Cu)
++        {
++            return; // NOP
++        }
++        else if constexpr (opHi == 0x00u) // LQ
++        {
++            constexpr uint8_t it = static_cast<uint8_t>((L >> 16) & 0x1Fu);
++            constexpr uint8_t is = static_cast<uint8_t>((L >> 11) & 0xFu);
++            constexpr uint8_t dest = static_cast<uint8_t>((L >> 21) & 0xFu);
++            constexpr int16_t imm = static_cast<int16_t>(static_cast<int32_t>(L << 21) >> 21);
++            uint32_t addr = static_cast<uint32_t>(static_cast<int32_t>(s.vi[is] + imm)) * 16u;
++            addr &= (env.dataSize - 1u);
++            if (addr + 16u <= env.dataSize)
++            {
++                float tmp[4];
++                std::memcpy(tmp, env.data + addr, 16);
++                plainStore(s.vf[it], tmp, dest);
++            }
++        }
++        else if constexpr (opHi == 0x08u || opHi == 0x09u) // IADDIU / ISUBIU
++        {
++            constexpr uint8_t it = static_cast<uint8_t>((L >> 16) & 0xFu);
++            constexpr uint8_t is = static_cast<uint8_t>((L >> 11) & 0xFu);
++            constexpr int16_t imm = static_cast<int16_t>(static_cast<int16_t>(L & 0x7FFu) | static_cast<int16_t>((L >> 10) & 0x7800u));
++            if constexpr (it != 0u)
++                s.vi[it] = opHi == 0x08u ? static_cast<int16_t>(s.vi[is] + imm) : static_cast<int16_t>(s.vi[is] - imm);
++        }
++        else if constexpr (opHi == 0x40u && ((L & 0x3Fu) == 0x30u || (L & 0x3Fu) == 0x31u || (L & 0x3Fu) == 0x34u || (L & 0x3Fu) == 0x35u))
++        {
++            constexpr uint8_t viT = static_cast<uint8_t>((L >> 16) & 0xFu);
++            constexpr uint8_t viS = static_cast<uint8_t>((L >> 11) & 0xFu);
++            constexpr uint8_t viD = static_cast<uint8_t>((L >> 6) & 0xFu);
++            constexpr uint32_t f = L & 0x3Fu;
++            if constexpr (viD != 0u)
++            {
++                if constexpr (f == 0x30u) s.vi[viD] = static_cast<int16_t>(s.vi[viS] + s.vi[viT]);
++                else if constexpr (f == 0x31u) s.vi[viD] = static_cast<int16_t>(s.vi[viS] - s.vi[viT]);
++                else if constexpr (f == 0x34u) s.vi[viD] = s.vi[viS] & s.vi[viT];
++                else s.vi[viD] = s.vi[viS] | s.vi[viT];
++            }
++        }
++        else if constexpr (opHi == 0x40u && (L & 0x3Fu) >= 0x3Cu && (((L & 3u) | ((L >> 4) & 0x7Cu)) == 0x30u))
++        {
++            // MOVE
++            constexpr uint8_t vfT = static_cast<uint8_t>((L >> 16) & 0x1Fu);
++            constexpr uint8_t vfS = static_cast<uint8_t>((L >> 11) & 0x1Fu);
++            constexpr uint8_t dest = static_cast<uint8_t>((L >> 21) & 0xFu);
++            float tmp[4];
++            std::memcpy(tmp, s.vf[vfS], 16);
++            plainStore(s.vf[vfT], tmp, dest);
++        }
++        else
++        {
++            vu.execLower(L, env.data, env.dataSize, *env.gs, env.memory, U);
++        }
++    }
++};
 diff --git a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-index bd75bba..988d0ed 100644
+index bd75bba..c7340b7 100644
 --- a/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
 +++ b/ps2xRuntime/src/lib/vu/ps2_vu1_core.cpp
-@@ -1,8 +1,10 @@
+@@ -1,8 +1,12 @@
++#include "ps2_vu1_compiled.h"
++#include <bit>
 +#include "runtime/gs/gs_draw_stats.h"
  #include "runtime/ps2_vu1.h"
  #include "runtime/gs/ps2_gif_arbiter.h"
@@ -2939,11 +5353,13 @@ index bd75bba..988d0ed 100644
  
  #include <algorithm>
  #include <cfenv>
-@@ -73,7 +75,16 @@ void VU1Interpreter::resetScheduler()
+@@ -73,7 +77,18 @@ void VU1Interpreter::resetScheduler()
      m_vfWritePipeline = {};
      m_viWritePipeline = {};
      m_accWritePipeline = {};
 -    m_xgkick = {};
++    m_nextCommitCycle = 0;
++    m_flagValidMask = m_storeValidMask = m_vfValidMask = m_viValidMask = m_accValidMask = 0u;
 +    // Zera so o estado de controle do PATH1; o buffer de 64 KB (packet) e sobrescrito antes de ser lido.
 +    // Antes `m_xgkick = {}` fazia memset de 64 KB a cada microprograma e a cada XGKICK (FUNCOES.md #45).
 +    m_xgkick.sourceAddress = 0u;
@@ -2957,7 +5373,7 @@ index bd75bba..988d0ed 100644
      m_vfReady = {};
      m_viReady = {};
      m_accReady = {};
-@@ -103,7 +114,7 @@ void VU1Interpreter::reset()
+@@ -103,7 +118,7 @@ void VU1Interpreter::reset()
  
  float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
  {
@@ -2966,7 +5382,33 @@ index bd75bba..988d0ed 100644
  }
  
  float VU1Interpreter::normalizeOperand(float value) const
-@@ -229,7 +240,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
+@@ -194,6 +209,16 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
+     applyDest(m_state.acc, result, dest);
+ }
+ 
++// Matematica rapida (FUNCOES.md #59): pula a reconstrucao do resultado exato em long double (refazia cada
++// operacao por componente so para overflow/underflow exatos) e o sticky dos produtos. O clamp e as flags de
++// sinal/zero saem do resultado em float (normalizeResult). PS2X_VU1_FAST_MATH=0 volta ao modo exato.
++static const bool s_vuFastMath = []() {
++    const char *v = std::getenv("PS2X_VU1_FAST_MATH");
++    return !v || std::atoi(v) != 0;
++}();
++
++bool vu1FastMathEnabled() { return s_vuFastMath; }
++
+ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+                                          uint8_t laneFlags[4])
+ {
+@@ -204,7 +229,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
+             continue;
+ 
+         long double exactResult = 0.0L;
+-        if (calculateFmacExactResult(component, exactResult))
++        if (!s_vuFastMath && calculateFmacExactResult(component, exactResult))
+         {
+             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
+             continue;
+@@ -229,7 +254,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
  
      const auto operand = [this](float value)
      {
@@ -2975,7 +5417,7 @@ index bd75bba..988d0ed 100644
      };
      const auto vs = [&](uint32_t lane)
      {
-@@ -454,27 +465,27 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
+@@ -454,27 +479,27 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
          static constexpr uint8_t crossLeft[4] = {1u, 2u, 0u, 3u};
          static constexpr uint8_t crossRight[4] = {2u, 0u, 1u, 3u};
          const uint8_t leftComponent = op == 0x2Eu ? crossLeft[component] : static_cast<uint8_t>(component);
@@ -3009,7 +5451,280 @@ index bd75bba..988d0ed 100644
          }
  
          float product = left * right;
-@@ -919,6 +930,7 @@ void VU1Interpreter::finishXgkick()
+@@ -531,8 +556,10 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
+ 
+     *entry = {};
+     entry->valid = true;
++    m_flagValidMask |= 1u << static_cast<uint32_t>(entry - m_flagPipeline.data());
+     entry->issueCycle = m_cycle;
+     entry->readyCycle = m_cycle + kFmacLatency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + kFmacLatency);
+     entry->mac = mac;
+     entry->status = status;
+     entry->extraSticky = extraSticky;
+@@ -544,7 +571,7 @@ void VU1Interpreter::applyFmacDest(float *dst, float *result, uint8_t dest)
+ {
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    updateFmacFlags(laneFlags, dest, s_vuFastMath ? 0u : calculateFmacProductSticky(dest));
+     applyDest(dst, result, dest);
+ }
+ 
+@@ -552,7 +579,7 @@ void VU1Interpreter::applyFmacDestAcc(float *result, uint8_t dest)
+ {
+     uint8_t laneFlags[4]{};
+     normalizeFmacResult(result, dest, laneFlags);
+-    updateFmacFlags(laneFlags, dest, calculateFmacProductSticky(dest));
++    updateFmacFlags(laneFlags, dest, s_vuFastMath ? 0u : calculateFmacProductSticky(dest));
+     applyDestAcc(result, dest);
+ }
+ 
+@@ -570,8 +597,10 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
+         {
+             entry = {};
+             entry.valid = true;
++            m_flagValidMask |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + kFmacLatency);
+             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
+             entry.writesSticky = true;
+             return;
+@@ -589,8 +618,10 @@ void VU1Interpreter::queueClip(uint32_t clip)
+         {
+             entry = {};
+             entry.valid = true;
++            m_flagValidMask |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + kFmacLatency);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -613,8 +644,10 @@ void VU1Interpreter::queueFcset(uint32_t clip)
+         {
+             entry = {};
+             entry.valid = true;
++            m_flagValidMask |= 1u << static_cast<uint32_t>(&entry - m_flagPipeline.data());
+             entry.issueCycle = m_cycle;
+             entry.readyCycle = m_cycle + kFmacLatency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + kFmacLatency);
+             entry.clip = m_workingClip;
+             entry.writesClip = true;
+             return;
+@@ -629,6 +662,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
+     value = normalizeResult(value, ignoredFlags);
+     m_fdiv.valid = true;
+     m_fdiv.readyCycle = m_cycle + latency;
++    m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + latency);
+     m_fdiv.value = value;
+     m_fdiv.statusDi = statusDi & 0x30u;
+ }
+@@ -643,6 +677,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
+         {
+             entry.valid = true;
+             entry.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + latency);
+             entry.value = value;
+             // EFU throughput is one cycle shorter than result visibility.
+             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
+@@ -659,7 +694,9 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
+         if (!store.valid)
+         {
+             store.valid = true;
++            m_storeValidMask |= 1u << static_cast<uint32_t>(&store - m_storePipeline.data());
+             store.readyCycle = m_cycle + 1u;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + 1u);
+             store.address = address;
+             store.laneMask = laneMask;
+             std::copy(words, words + 4, store.words.begin());
+@@ -680,7 +717,9 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
+         {
+             write = {};
+             write.valid = true;
++            m_vfValidMask |= 1u << static_cast<uint32_t>(&write - m_vfWritePipeline.data());
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + latency);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.laneMask = laneMask;
+@@ -706,7 +745,9 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
+         {
+             write = {};
+             write.valid = true;
++            m_viValidMask |= 1u << static_cast<uint32_t>(&write - m_viWritePipeline.data());
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + latency);
+             write.sequence = ++m_nextWriteSequence;
+             write.reg = reg;
+             write.value = value;
+@@ -727,7 +768,9 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+         {
+             write = {};
+             write.valid = true;
++            m_accValidMask |= 1u << static_cast<uint32_t>(&write - m_accWritePipeline.data());
+             write.readyCycle = m_cycle + latency;
++            m_nextCommitCycle = std::min(m_nextCommitCycle, m_cycle + latency);
+             write.sequence = ++m_nextWriteSequence;
+             write.laneMask = laneMask;
+             std::copy(value, value + 4, write.value.begin());
+@@ -742,12 +785,35 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
+     reportReservedInstruction(true, 0xFFFFFFF5u);
+ }
+ 
++// Modo rapido (FUNCOES.md #58): resultados de VF/ACC entram no estado na hora, sem fila de latencia e
++// sem stall. No VU real o pipeline do FMAC trava sozinho ate o resultado sair (interlock), entao o programa
++// le o mesmo valor; muda so a contagem de ciclos. Q (FDIV), P (EFU), flags (MAC/status/clip) e VI (lido
++// com atraso pelos desvios) continuam com latencia. PS2X_VU1_FAST=0 volta ao modelo ciclo a ciclo.
++static const bool s_vuFastFmac = []() {
++    const char *v = std::getenv("PS2X_VU1_FAST");
++    return !v || std::atoi(v) != 0;
++}();
++
++bool vu1FastFmacEnabled() { return s_vuFastFmac; }
++
+ void VU1Interpreter::commitReadyPipelines()
+ {
+-    for (FlagPipelineEntry &entry : m_flagPipeline)
++    // Nada fica pronto antes de m_nextCommitCycle: evita varrer todos os pipelines a cada ciclo.
++    if (m_cycle < m_nextCommitCycle)
++        return;
++    uint64_t next = UINT64_MAX; // menor readyCycle que continua pendente (mesma passada)
++
++    for (uint32_t bits = m_flagValidMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!entry.valid || entry.readyCycle > m_cycle)
++        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(bits));
++        FlagPipelineEntry &entry = m_flagPipeline[slot];
++        if (!entry.valid)
++            continue;
++        if (entry.readyCycle > m_cycle)
++        {
++            next = std::min(next, entry.readyCycle);
+             continue;
++        }
+ 
+         if (entry.writesMac)
+             m_state.mac = entry.mac;
+@@ -763,9 +829,12 @@ void VU1Interpreter::commitReadyPipelines()
+         if (entry.writesClip)
+             m_state.clip = entry.clip;
+         entry = {};
++        m_flagValidMask &= ~(1u << slot);
+     }
+ 
+-    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
++    if (m_fdiv.valid && m_fdiv.readyCycle > m_cycle)
++        next = std::min(next, m_fdiv.readyCycle);
++    else if (m_fdiv.valid)
+     {
+         m_state.q = m_fdiv.value;
+         const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+@@ -780,12 +849,21 @@ void VU1Interpreter::commitReadyPipelines()
+             m_state.p = entry.value;
+             entry = {};
+         }
++        else if (entry.valid)
++            next = std::min(next, entry.readyCycle);
+     }
+ 
+-    for (PendingStore &store : m_storePipeline)
++    for (uint32_t bits = m_storeValidMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!store.valid || store.readyCycle > m_cycle)
++        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingStore &store = m_storePipeline[slot];
++        if (!store.valid)
+             continue;
++        if (store.readyCycle > m_cycle)
++        {
++            next = std::min(next, store.readyCycle);
++            continue;
++        }
+         if (m_activeVuData && store.address + 16u <= m_activeVuDataSize)
+         {
+             uint32_t oldWords[4]{};
+@@ -798,12 +876,20 @@ void VU1Interpreter::commitReadyPipelines()
+             std::memcpy(m_activeVuData + store.address, oldWords, sizeof(oldWords));
+         }
+         store = {};
++        m_storeValidMask &= ~(1u << slot);
+     }
+ 
+-    for (PendingVfWrite &write : m_vfWritePipeline)
++    for (uint32_t bits = m_vfValidMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingVfWrite &write = m_vfWritePipeline[slot];
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
+             continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -813,21 +899,37 @@ void VU1Interpreter::commitReadyPipelines()
+             }
+         }
+         write = {};
++        m_vfValidMask &= ~(1u << slot);
+     }
+ 
+-    for (PendingViWrite &write : m_viWritePipeline)
++    for (uint32_t bits = m_viValidMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingViWrite &write = m_viWritePipeline[slot];
++        if (!write.valid)
+             continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
++            continue;
++        }
+         if (m_viLatestWrite[write.reg] == write.sequence)
+             m_state.vi[write.reg] = static_cast<int16_t>(write.value);
+         write = {};
++        m_viValidMask &= ~(1u << slot);
+     }
+ 
+-    for (PendingAccWrite &write : m_accWritePipeline)
++    for (uint32_t bits = m_accValidMask; bits != 0u; bits &= bits - 1u)
+     {
+-        if (!write.valid || write.readyCycle > m_cycle)
++        const uint32_t slot = static_cast<uint32_t>(std::countr_zero(bits));
++        PendingAccWrite &write = m_accWritePipeline[slot];
++        if (!write.valid)
++            continue;
++        if (write.readyCycle > m_cycle)
++        {
++            next = std::min(next, write.readyCycle);
+             continue;
++        }
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((write.laneMask & laneForComponent(component)) != 0u &&
+@@ -837,9 +939,13 @@ void VU1Interpreter::commitReadyPipelines()
+             }
+         }
+         write = {};
++        m_accValidMask &= ~(1u << slot);
+     }
++
++    m_nextCommitCycle = next;
+ }
+ 
++
+ void VU1Interpreter::progressXgkick()
+ {
+     if (!m_xgkick.active || !m_activeVuData || m_activeVuDataSize == 0u)
+@@ -919,6 +1025,7 @@ void VU1Interpreter::finishXgkick()
      if (!m_xgkick.active)
          return;
  
@@ -3017,7 +5732,7 @@ index bd75bba..988d0ed 100644
      if (m_activeMemory)
          m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
      else if (m_activeGs)
-@@ -931,8 +943,18 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
+@@ -931,8 +1038,18 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
      if (m_unit != Unit::VU1 || !m_activeVuData || m_activeVuDataSize < 16u)
          return;
  
@@ -3037,7 +5752,46 @@ index bd75bba..988d0ed 100644
      m_xgkick.active = true;
      m_xgkick.sourceAddress = sourceAddress;
      m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
-@@ -1591,6 +1613,12 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+@@ -1005,11 +1122,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+                     ready = std::max(ready, m_vfReady[access.reg][component]);
+             }
+         }
+-        for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-        {
+-            if ((usage->viRead & (1u << reg)) != 0u)
+-                ready = std::max(ready, m_viReady[reg]);
+-        }
++        for (uint32_t bits = usage->viRead & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++            ready = std::max(ready, m_viReady[static_cast<uint32_t>(std::countr_zero(bits))]);
+         for (uint32_t component = 0; component < 4u; ++component)
+         {
+             if ((usage->accRead & laneForComponent(component)) != 0u)
+@@ -1036,6 +1150,8 @@ uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &d
+ 
+ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+ {
++    if (!s_vuFastFmac)
++    {
+     const VfAccess lowerWrite = decoded.lowerUsage.vfWrite;
+     if (lowerWrite.reg != 0u &&
+         decoded.suppressedLowerVf != lowerWrite.reg)
+@@ -1063,11 +1179,11 @@ void VU1Interpreter::markPairWrites(const DecodedInstructionPair &decoded)
+         }
+     }
+ 
+-    for (uint32_t reg = 1; reg < m_viReady.size(); ++reg)
+-    {
+-        if ((decoded.lowerUsage.viWrite & (1u << reg)) != 0u)
+-            m_viReady[reg] = m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
+     }
++    for (uint32_t bits = decoded.lowerUsage.viWrite & 0xFFFEu; bits != 0u; bits &= bits - 1u)
++        m_viReady[static_cast<uint32_t>(std::countr_zero(bits))] =
++            m_cycle + (decoded.lowerUsage.viLatency != 0u ? decoded.lowerUsage.viLatency : decoded.lowerUsage.latency);
++    if (!s_vuFastFmac)
+     for (uint32_t component = 0; component < 4u; ++component)
+     {
+         if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+@@ -1591,6 +1707,12 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                               uint32_t maxCycles)
  {
      resetScheduler();
@@ -3050,7 +5804,17 @@ index bd75bba..988d0ed 100644
      m_state.pc = startPC & microAddressMask();
      m_state.ebit = false;
      m_state.haltAfterDelaySlot = false;
-@@ -1632,7 +1660,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1605,6 +1727,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
+     m_state.vf[0][1] = 0.0f;
+     m_state.vf[0][2] = 0.0f;
+     m_state.vf[0][3] = 1.0f;
++    // Microprograma recompilado, se houver um registrado para este codigo (FUNCOES.md #61)
++    if (Vu1Compiled::tryRun(*this, vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles))
++        return;
+     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+ }
+ 
+@@ -1632,7 +1757,24 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
      const int previousRoundingMode = std::fegetround();
      const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
      const uint64_t budgetEnd = m_cycle + maxCycles;
@@ -3075,7 +5839,7 @@ index bd75bba..988d0ed 100644
      while (m_cycle < budgetEnd && !m_stopRequested)
      {
          commitReadyPipelines();
-@@ -1640,6 +1685,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1640,6 +1782,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              break;
  
          const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
@@ -3088,7 +5852,28 @@ index bd75bba..988d0ed 100644
          if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
          {
              reportReservedInstruction(decoded.upperUsage.reserved, decoded.upperUsage.reserved ? decoded.upper : decoded.lower);
-@@ -1695,7 +1746,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1683,19 +1831,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+         float newLowerVf[4]{};
+         float oldAcc[4]{};
+         float newAcc[4]{};
+-        if (hasUpperWrite)
+-            std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
+-        if (hasDistinctLowerWrite)
+-            std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
+-        if (decoded.upperUsage.accWrite != 0u)
+-            std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++        if (!s_vuFastFmac)
++        {
++            if (hasUpperWrite)
++                std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
++            if (hasDistinctLowerWrite)
++                std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
++            if (decoded.upperUsage.accWrite != 0u)
++                std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
++        }
+ 
+         if (decoded.iBit)
+         {
              execUpper(decoded.upper);
              float immediate = 0.0f;
              std::memcpy(&immediate, &decoded.lower, sizeof(immediate));
@@ -3097,7 +5882,34 @@ index bd75bba..988d0ed 100644
          }
          else if (decoded.upperVfShadowReg != 0u)
          {
-@@ -1824,6 +1875,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+@@ -1724,7 +1875,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+ 
+         m_viBranchBackupValid = false;
+ 
+-        if (hasUpperWrite)
++        if (hasUpperWrite && !s_vuFastFmac)
+         {
+             std::memcpy(newUpperVf, m_state.vf[upperWrite.reg], sizeof(newUpperVf));
+             std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
+@@ -1734,7 +1885,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                     : decoded.upperUsage.latency;
+             queueVfWrite(upperWrite.reg, upperWrite.lanes, newUpperVf, latency);
+         }
+-        if (hasDistinctLowerWrite)
++        if (hasDistinctLowerWrite && !s_vuFastFmac)
+         {
+             std::memcpy(newLowerVf, m_state.vf[lowerWrite.reg], sizeof(newLowerVf));
+             std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
+@@ -1743,7 +1894,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
+                                          : decoded.lowerUsage.latency;
+             queueVfWrite(lowerWrite.reg, lowerWrite.lanes, newLowerVf, latency);
+         }
+-        if (decoded.upperUsage.accWrite != 0u)
++        if (decoded.upperUsage.accWrite != 0u && !s_vuFastFmac)
+         {
+             std::memcpy(newAcc, m_state.acc, sizeof(newAcc));
+             std::memcpy(m_state.acc, oldAcc, sizeof(oldAcc));
+@@ -1824,6 +1975,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
              break;
      }
  

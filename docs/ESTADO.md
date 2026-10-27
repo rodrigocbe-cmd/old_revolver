@@ -4,6 +4,48 @@ _Última atualização: 2026-10-15 (desktop, sessão noturna)_
 
 ## Marco atual
 
+**GS na GPU (2026-10-22, #65):** paraLLEl-GS (Vulkan compute, `external/parallel-gs` @ `cc6184af7e0c`, LGPL-3.0)
+integrado como backend opcional: `PS2X_GS_BACKEND=parallel` (build com `PS2X_PARALLEL_GS_DIR`, passado pelo
+`3_build.ps1`). Boot → logos → FMV → menu renderizam na RTX 3060 sem erros Vulkan
+(`logs/run_20261022_150452_drive.log`); boot/FMV a ~600 FINISH/600 ticks. Gameplay (tutorial, Red criança): **75 FINISH/600 ticks** (≈7,5 fps) contra 62–63 no GS em software (+20%), imagem correta (`logs/run_20261022_151520_drive.log`). Teto sem desenho era 171: o limite agora é outro (EE quase sem ociosidade, `ee.idle_ms`≈70; suspeitos: parse GIF na thread do jogo, readback síncrono segurando o mutex).
+Pendências: medir gameplay e comparar com o GS em software; readback por quadro é síncrono (fence); scanout
+fixa SMODE1 NTSC quando vazio; SSAA via `PS2X_GS_SSAA=2|4|8|16` não testado; `clearFramebufferContext` (stub
+sceGs) não passa pela ponte.
+
+**Desempenho (2026-10-17 17h):** gameplay FINISH/600 ticks 14 → 25 (GS em thread, #55) → 27 (faixas, #56) → 31 → 34 → 38 (VU1, #57) → 40–41 (VU1 rápido, #58) → 44 (matemática rápida do VU, #59) → 52 (**VU1 recompilado**, #61; ~3,7× sobre o início). Depois: HLE da mistura de áudio do AGESND (#62) e IRQ do GS por borda (#63) não mudaram o FPS. Perfil atual (gameplay, 59 amostras): thread do jogo ~73% ocupada (VU1 compilado ainda usa a maquinaria de pipelines do interpretador por par: flags, fila de VI, `advanceOneCycle`) e ~27% esperando o GS esvaziar no FINISH; faixas do GS ~42% ocupadas (WritePixel/SampleTexture, `threadTextureCache` por texel, `bitsPerPixel`). Atualização (#64): sem desenho o jogo faz 171 quadros/600 vblanks (~17 fps) ⇒ o teto atual é o rasterizador do GS em software; com ajustes por pixel e 5 faixas: **62–63** (~6 fps). Próximo salto: **GS na GPU**. Próximo salto real: recompilar os microprogramas do VU1.
+
+**Microprogramas do VU1 (2026-10-17, `PS2X_VU1_DUMP_MPG`, #60):** do boot ao gameplay o jogo envia só **12 programas distintos** (~20 KB, ≈2.500 pares de instruções), sempre iguais e em endereços fixos (0x0000, 0x0800, 0x1000, 0x1F40, 0x2740, 0x2F40, 0x3740). Viabiliza recompilação estática: gerar C++ por programa (pares em linha reta, desvios como goto, VF/ACC imediatos como no modo rápido, flags com atraso de 4 pares via buffer circular, Q/P com cópia antiga quando lidos antes de WAITQ, XGKICK síncrono) e, no `MSCAL`, despachar para a função compilada quando o hash da memória de código bater; senão, interpretador. Gargalo atual: interpretador do VU1 na thread do jogo.
+
+**Plano de longo prazo (definido com o usuário em 2026-10-17; não é o foco agora — primeiro fazer o jogo rodar):**
+recompilar o máximo possível para a arquitetura do PC em vez de emular. Situação: o EE (CPU principal) e o
+VU0 em modo macro já são recompilados para x64; VU1 é interpretado ciclo a ciclo; GS é rasterizado em
+software na CPU; IOP é interpretado (IRX originais + HLE); SPU2 emulado (sem saída de som ainda).
+Caminhos, em ordem de impacto esperado: (1) **GS na GPU** (OpenGL/Vulkan) em vez do rasterizador em
+CPU — maior ganho e permite resolução alta; (2) **recompilar os microprogramas do VU1** para código
+nativo (como o ICO recomp) em vez de interpretar; (3) **fastmem**: reservar 4 GB de endereços e mapear a
+RAM do PS2 numa base fixa com os espelhos (kseg0/kseg1/uncached) por memória virtual, e tratar registradores
+de hardware por proteção de página — tira máscara/teste de cada acesso e deixa a base fixa (Cheat Engine);
+(4) HLE de mais módulos do IOP. Limite: ponteiros nativos de 64 bits exigiriam reescrever o jogo
+(decompilação manual); as estruturas do jogo guardam ponteiros de 32 bits.
+
+**Ideias pendentes (pedido do usuário, depois do desempenho):** (1) alocar a RAM do PS2 num endereço fixo do processo para tabelas do Cheat Engine valerem entre execuções (hoje endereço = base do bloco + endereço PS2); (2) suporte a `.pnach` (códigos CodeBreaker/GameShark como no PCSX2) no runtime.
+
+**Desempenho (2026-10-17 14h):** GS em thread própria (#55): +79% de quadros no gameplay (FINISH/600 ticks
+14 → 25, `logs/run_20261017_133430_drive.log`). Próximos candidatos: VU1 (interpretador, ~17% do tempo do jogo),
+rasterização paralela por faixas dentro do GS, e medir de novo onde a thread do jogo gasta.
+
+**Teste do usuário (2026-10-17 13h):** andou na fase 1 sem cair, direcionais/WASD funcionam, tutorial
+avança. O jogo fechou porque Esc fechava a janela (#54, corrigido). Gargalo agora: desempenho no gameplay.
+
+**Plano pendente — mira direta com mouse (estilo GTA VC).** Hoje o mouse vira analógico direito (#53): o jogo
+transforma inclinação em velocidade de giro (com aceleração), então a mira "desliza". Objetivo: movimento do
+mouse = ângulo (sem aceleração). Passos: (1) achar na RAM os ângulos de câmera/mira do Red (yaw/pitch) com
+`PS2X_WRITE_WATCH` e dumps F9, girando a câmera com o analógico; pistas no motor: `AimHorizSensitivity`,
+`AimVertSensitivity`, `AimRampX/Y`, `CameraAimOffset`/`CameraAimScale`; (2) em `src/rdr_overrides.cpp`,
+somar Δmouse × sensibilidade direto nesses ângulos a cada quadro e manter o analógico direito centrado;
+(3) respeitar limites do jogo (pitch máximo, mira travada/L1). Antes disso: confirmar no tutorial quais
+botões mirar/atirar/zoom (padrão provisório: esquerdo=R1, direito=L1, rodinha=R3).
+
 **Progresso (2026-10-17 10h): GAMEPLAY — Red anda na fase 1.** A queda pelo terreno era do recompilador
 (#52): `LQ/SQ/LQC2/SQC2` não alinhavam o endereço (`& ~0xF`), e o teste de triângulo da malha do cenário
 (`FUN_001A2BA8`, vértices de 12 bytes lidos com LQ+MTSAB+QFSRV) recebia vértices deslocados. Com a correção

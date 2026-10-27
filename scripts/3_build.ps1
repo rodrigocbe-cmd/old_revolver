@@ -17,13 +17,17 @@ $build = Join-Path $RDR_ROOT 'out\build'
 if (-not (Test-Path (Join-Path $gen 'register_functions.cpp'))) { throw 'out/generated vazio: rode 2_recompile.ps1' }
 
 if (-not $NoSync) {
-    # Sincroniza o codigo gerado + overrides do projeto, copiando so o que mudou de conteudo
+    # Sincroniza o codigo gerado + overrides do projeto + microprogramas do VU1 recompilados (out/vu1gen,
+    # tools/vu1_recomp.py), copiando so o que mudou de conteudo
     # (preserva a data dos arquivos identicos para o Ninja nao recompilar tudo)
-    python -I (Join-Path $RDR_ROOT 'tools\sync_generated.py') $gen $runner $include (Join-Path $RDR_ROOT 'src')
+    python -I (Join-Path $RDR_ROOT 'tools\sync_generated.py') $gen $runner $include (Join-Path $RDR_ROOT 'src') (Join-Path $RDR_ROOT 'out\vu1gen')
     if ($LASTEXITCODE) { throw 'falha ao sincronizar out/generated com o runner' }
 
+    # GS na GPU (paraLLEl-GS, opcional): external/parallel-gs clonado com submodulos (FUNCOES.md #65)
+    $pgs = Join-Path $RDR_ROOT 'external\parallel-gs'
+    $pgsArg = if (Test-Path (Join-Path $pgs 'Granite\CMakeLists.txt')) { "-DPS2X_PARALLEL_GS_DIR=$pgs" } else { '-DPS2X_PARALLEL_GS_DIR=' }
     cmake -S $src -B $build -G Ninja "-DCMAKE_BUILD_TYPE=$Config" `
-        -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF
+        -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF $pgsArg
     if ($LASTEXITCODE) { throw 'configuracao do CMake falhou' }
 }
 
@@ -43,7 +47,10 @@ try {
 } finally {
     [void][Win32.Power]::SetThreadExecutionState($ES_CONTINUOUS)
 }
-Get-Content $log -Tail 20
 "build exit $code (log: $log)"
-if ($code) { exit $code }
+if ($code) {
+    # Só os erros distintos (tools/run_report.py --build), em vez das últimas linhas cruas
+    python -I (Join-Path $RDR_ROOT 'tools\run_report.py') $log --build
+    exit $code
+}
 Get-ChildItem $build -Recurse -Filter ps2EntryRunner.exe | Select-Object -ExpandProperty FullName

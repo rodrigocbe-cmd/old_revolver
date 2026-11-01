@@ -1,0 +1,4 @@
+# Parametros do motor passados ao jogo como argv (ver docs/FUNCOES.md #74). Um por linha; # comenta.
+# Ex.: unlockall (libera capitulos e extras), noenemies, level=lvl_tomb
+unlockall
+widescreen

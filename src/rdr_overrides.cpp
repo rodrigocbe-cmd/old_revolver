@@ -6,18 +6,28 @@
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
+#include "runtime/ee_scheduler.h"
 #include "runtime/ps2_mpeg_options.h"
 #include "runtime/gs/gs_draw_stats.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <system_error>
 #include <utility>
+#include <vector>
+
+bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4]); // rdr_quit_dialog.cpp
+std::filesystem::path rdrDocumentsDirectory();                                 // rdr_win32.cpp
 
 namespace
 {
@@ -32,6 +42,12 @@ namespace
         if (const char *env = std::getenv("RDR_CD_IMAGE"); env && env[0] != '\0')
         {
             return std::filesystem::path(env);
+        }
+
+        // Versao de distribuicao: disco virtual montado dos arquivos instalados (rdr_install.cpp)
+        if (std::error_code vec; std::filesystem::exists(elfDirectory / "disc.vdisc", vec))
+        {
+            return elfDirectory / "disc.vdisc";
         }
 
         std::error_code ec;
@@ -60,6 +76,59 @@ namespace
         if (out != 0u)
             WRITE32(out, 0u);
         SET_GPR_U32(ctx, 2, 1u);
+        ctx->pc = GPR_U32(ctx, 31);
+    }
+
+    // Avisos de memory card no boot (FUNCOES.md #91): FUN_00101BA8 (boot) mostra popups do Flash popups_01
+    // (autosave "Insertion of a memory card (8MB)...", falta de espaco etc.) conforme o estado do memory card e
+    // espera "playerResponse" (0x515348) >= 0, lido por FUN_00103428(popup, nome, &valor). So essa funcao le
+    // essa variavel; respondendo 0 (primeiro botao, aceitar) na mesma leitura o popup nunca e desenhado e o save
+    // segue direto, como se gravasse na memoria do PC. RDR_SHOW_MC_POPUPS=1 mantem o original.
+    PS2Runtime::RecompiledFunction g_origPopupGetVar = nullptr;
+
+    void popupAutoAccept(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t name = GPR_U32(ctx, 5), out = GPR_U32(ctx, 6);
+        g_origPopupGetVar(rdram, ctx, runtime);
+        if (name == 0x00515348u && out != 0u)
+        {
+            int32_t v = 0;
+            std::memcpy(&v, rdram + (out & 0x1FFFFFFu), 4);
+            if (v < 0)
+            {
+                static int s_logged = 0;
+                if (s_logged++ < 4)
+                    std::fprintf(stderr, "[rdr] aviso de memory card respondido automaticamente\n");
+                v = 0;
+                std::memcpy(rdram + (out & 0x1FFFFFFu), &v, 4);
+            }
+        }
+    }
+
+    // O aviso de autosave ("Insertion of a memory card (8MB)... MEMORY CARD slot 1-A") e um quadro do Flash de
+    // abertura logo01 (FUN_00101BA8, variavel "slotName" = "slot 1-A,"). A variavel "skip" (0x51539D) desse Flash
+    // vale 1 quando o save carregou (o Flash pula o aviso) e 0 sem save. Gravando sempre 1, o aviso nao aparece.
+    PS2Runtime::RecompiledFunction g_origPopupSetVar = nullptr;
+
+    void popupSetVarNoMcNotice(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (GPR_U32(ctx, 5) == 0x0051539Du && GPR_U32(ctx, 6) == 0u)
+        {
+            static int s_logged = 0;
+            if (s_logged++ < 4)
+                std::fprintf(stderr, "[rdr] aviso de autosave da abertura pulado\n");
+            SET_GPR_U32(ctx, 6, 1u);
+        }
+        g_origPopupSetVar(rdram, ctx, runtime);
+    }
+
+    // Controle de PS2 dos tutoriais (FUNCOES.md #90): o widget de HUD (vtable 0x503880, construtor FUN_0015AEF0,
+    // 17 partes "leftTwoButton".."controller" da tabela 0x4F7318) desenha o controle 3D no slot 8, FUN_0015B6C0.
+    // Sem desenho, o resto do tutorial (texto, logica) segue igual. RDR_SHOW_PAD=1 mantem o original.
+    void skipTutorialPadDraw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
         ctx->pc = GPR_U32(ctx, 31);
     }
 
@@ -116,6 +185,8 @@ namespace
         if (n < 20)
             std::fprintf(stderr, "[call] 0x%06x #%ld ra=0x%06x a0=0x%x a1=0x%x a2=0x%x a3=0x%x\n", g_tracedAddr[N], n, ra,
                          GPR_U32(ctx, 4), GPR_U32(ctx, 5), GPR_U32(ctx, 6), GPR_U32(ctx, 7));
+        else if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[call] 0x%06x total %ld (ra=0x%06x a0=0x%x)\n", g_tracedAddr[N], n, ra, GPR_U32(ctx, 4));
         g_tracedOrig[N](rdram, ctx, runtime);
         if (n < 20)
             std::fprintf(stderr, "[call] 0x%06x #%ld -> v0=0x%x\n", g_tracedAddr[N], n, GPR_U32(ctx, 2));
@@ -258,8 +329,625 @@ namespace
         g_origFrameTime(rdram, ctx, runtime);
     }
 
+    // Parametros de linha de comando do motor (FUNCOES.md #74). main (FUN_00100250) passa argc/argv a
+    // FUN_0025A070, que guarda "-nome[=valor]" na tabela de parametros (0x737F90); FUN_00100308 depois
+    // consulta nomes como "unlockall" (libera capitulos, trapacas, diario, multi, dificuldades: "lvlaccess"
+    // etc.), "noenemies" e "level". O PS2 nao recebe argumentos, entao acrescentamos os de
+    // config/params.txt (um por linha, # comenta) e de RDR_PARAMS (separados por espaco).
+    std::vector<std::string> g_extraArgs;
+    PS2Runtime::RecompiledFunction g_origParseArgs = nullptr;
+    PS2Runtime::RecompiledFunction g_guestMalloc = nullptr; // FUN_00219E70(tamanho)
+
+    // Diagnostico: RDR_TRACE_PARAMS=1 registra cada nome consultado na tabela de parametros (1a vez).
+    PS2Runtime::RecompiledFunction g_origParamLookup = nullptr; // FUN_0025C0C8(tabela, nome)
+    std::vector<std::string> g_paramsSeen;
+
+    void traceParamLookup(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t ra = GPR_U32(ctx, 31);
+        // 0x25A0F4 (parse de argv) e 0x25A394 (FUN_0025A360) so procuram antes de gravar.
+        if (GPR_U32(ctx, 4) == 0x00747F90u && ra != 0x0025A0F4u && ra != 0x0025A394u)
+        {
+            const char *p = reinterpret_cast<const char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
+            std::string name(p, strnlen(p, 64));
+            if (std::find(g_paramsSeen.begin(), g_paramsSeen.end(), name) == g_paramsSeen.end())
+            {
+                g_paramsSeen.push_back(name);
+                g_origParamLookup(rdram, ctx, runtime);
+                // Os consultores (FUN_0025A518 etc.) guardam o ra do chamador em 0x8($sp).
+                uint32_t caller = 0;
+                std::memcpy(&caller, rdram + ((GPR_U32(ctx, 29) + 8u) & 0x1FFFFFFu), 4);
+                std::fprintf(stderr, "[param] %s ra=0x%06x chamador=0x%06x -> %s\n", name.c_str(), ra, caller,
+                             GPR_U32(ctx, 2) ? "sim" : "nao");
+                return;
+            }
+        }
+        g_origParamLookup(rdram, ctx, runtime);
+    }
+
+    void loadExtraArgs()
+    {
+        auto add = [](std::string s) {
+            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+                s.pop_back();
+            size_t b = 0;
+            while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b])))
+                ++b;
+            s.erase(0, b);
+            if (s.empty() || s[0] == '#')
+                return;
+            g_extraArgs.push_back(s[0] == '-' ? s : "-" + s);
+        };
+        // RDR_PARAMS_FILE=none ignora o arquivo (bissecao do heap overrun no loading, FUNCOES.md #88)
+        const char *fileEnv = std::getenv("RDR_PARAMS_FILE");
+        const bool useFile = !(fileEnv && std::strcmp(fileEnv, "none") == 0);
+        for (const char *base : {"", "../", "../../"})
+        {
+            if (!useFile)
+                break;
+            std::ifstream in(std::string(base) + "config/params.txt");
+            if (!in)
+                continue;
+            for (std::string line; std::getline(in, line);)
+                add(line);
+            break;
+        }
+        if (const char *env = std::getenv("RDR_PARAMS"))
+        {
+            std::string all(env), tok;
+            for (char c : all + " ")
+            {
+                if (c == ' ')
+                    add(std::exchange(tok, {}));
+                else
+                    tok += c;
+            }
+        }
+        // O jogo sempre liga em widescreen (pedido do usuario); "nowidescreen" nos parametros desliga.
+        const bool noWide = std::find(g_extraArgs.begin(), g_extraArgs.end(), "-nowidescreen") != g_extraArgs.end();
+        if (!noWide && std::find(g_extraArgs.begin(), g_extraArgs.end(), "-widescreen") == g_extraArgs.end())
+            g_extraArgs.push_back("-widescreen");
+    }
+
+    void parseArgsWithExtras(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t argc = GPR_U32(ctx, 4), argv = GPR_U32(ctx, 5);
+        const uint32_t total = argc + static_cast<uint32_t>(g_extraArgs.size());
+        uint32_t bytes = (total + 1u) * 4u;
+        for (const std::string &a : g_extraArgs)
+            bytes += static_cast<uint32_t>(a.size()) + 1u;
+
+        const uint32_t ra = GPR_U32(ctx, 31);
+        SET_GPR_U32(ctx, 4, bytes);
+        g_guestMalloc(rdram, ctx, runtime);
+        const uint32_t block = GPR_U32(ctx, 2);
+        SET_GPR_U32(ctx, 31, ra);
+        if (block == 0u)
+        {
+            std::fprintf(stderr, "[rdr] parametros: malloc do jogo falhou, ignorando %zu extras\n", g_extraArgs.size());
+            SET_GPR_U32(ctx, 4, argc);
+            SET_GPR_U32(ctx, 5, argv);
+            g_origParseArgs(rdram, ctx, runtime);
+            return;
+        }
+
+        auto ptr = [rdram](uint32_t a) { return rdram + (a & 0x1FFFFFFu); };
+        uint32_t str = block + (total + 1u) * 4u;
+        for (uint32_t i = 0; i < argc; ++i)
+            std::memcpy(ptr(block + i * 4u), ptr(argv + i * 4u), 4);
+        for (size_t i = 0; i < g_extraArgs.size(); ++i)
+        {
+            const std::string &a = g_extraArgs[i];
+            std::memcpy(ptr(str), a.c_str(), a.size() + 1);
+            std::memcpy(ptr(block + (argc + static_cast<uint32_t>(i)) * 4u), &str, 4);
+            std::fprintf(stderr, "[rdr] parametro: %s\n", a.c_str());
+            str += static_cast<uint32_t>(a.size()) + 1u;
+        }
+        std::memset(ptr(block + total * 4u), 0, 4);
+
+        SET_GPR_U32(ctx, 4, total);
+        SET_GPR_U32(ctx, 5, block);
+        g_origParseArgs(rdram, ctx, runtime);
+    }
+
+    // Pular fases (FUNCOES.md #75): o livro de capitulos (vtable 0x5024C0, update FUN_0011B0F0) navega pela
+    // tabela de capitulos DAT_007436B8 (ate 0x28 ponteiros, termina em 0) e pula as entradas com o byte
+    // +0x35 == 0 (capitulo ainda nao liberado). O "lvlaccess" do motor nao e mais consultado no build final;
+    // com -unlockall ou -lvlaccess marcamos todas as entradas como liberadas antes de cada update do livro.
+    PS2Runtime::RecompiledFunction g_origBookUpdate = nullptr;
+
+    void bookUpdateAllChapters(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (std::getenv("RDR_TRACE_BOOK"))
+        {
+            static bool listed = false;
+            static uint32_t lastBits = 0;
+            auto rd = [rdram](uint32_t a) { uint32_t v = 0; std::memcpy(&v, rdram + (a & 0x1FFFFFFu), 4); return v; };
+            const uint32_t self = GPR_U32(ctx, 4), view = rd(self + 0x44Cu), bits = rd(self + 0x304u);
+            if (!listed)
+            {
+                listed = true;
+                std::string flags;
+                for (uint32_t i = 0; i < 0x28u && rd(0x007436B8u + i * 4u); ++i)
+                    flags += rdram[(rd(0x007436B8u + i * 4u) + 0x35u) & 0x1FFFFFFu] ? '1' : '0';
+                std::fprintf(stderr, "[book] capitulos +0x35=%s lista=%u\n", flags.c_str(), rd(self + 0x460u) & 0xFFFFu);
+            }
+            if (bits != lastBits)
+                std::fprintf(stderr, "[book] bits=0x%08x view+0xfc=%u pagina=%u base=%u\n", bits, rd(view + 0xFCu),
+                             rd(view + 0x100u), rd(self + 0x464u));
+            lastBits = bits;
+        }
+        // Com DAT_0079E21C != 1 (0 = historia; 1 = BHUNTER, desafios) o update ignora a seta para a direita.
+        // Forcamos 1 so durante o update do livro e devolvemos o modo original depois; no Begin (+0x304 & 0x1100000)
+        // a fase escolhida carrega no modo original. Com 1 a fase virava desafio do Bounty Hunter ("tentar
+        // novamente" ao quebrar a regra do desafio, mesmo sem morrer).
+        uint32_t origMode = 0;
+        std::memcpy(&origMode, rdram + 0x0079E21Cu, 4);
+        const uint32_t selectMode = 1u;
+        std::memcpy(rdram + 0x0079E21Cu, &selectMode, 4);
+        g_origBookUpdate(rdram, ctx, runtime);
+        std::memcpy(rdram + 0x0079E21Cu, &origMode, 4);
+    }
+
+    // Liberacao invalida (FUNCOES.md #80): o free do heap (FUN_00218DD8(heap, ptr), chamado por free
+    // FUN_00219EC0) confere os vizinhos do bloco e, se nao batem, entra num laco infinito proposital. No
+    // loading do capitulo 2 (HNG.DAT) isso travou com o heap principal integro, ou seja, ponteiro que nao e
+    // inicio de bloco (liberacao dupla ou ponteiro alheio). Conferimos antes; invalido = registra e ignora
+    // (vaza o bloco em vez de travar). Os 6 subpools (FUN_00219A10) sao tentados primeiro, como no original.
+    PS2Runtime::RecompiledFunction g_origHeapFree = nullptr;
+    PS2Runtime::RecompiledFunction g_subpoolFree = nullptr;
+
+    // Rastreio de alocacoes (RDR_HEAP_TRACK=1): blocos vivos por heap e por quem alocou (ra do alocador
+    // FUN_00218860 e, se ele veio dos wrappers de malloc 0x219E70..0x219FFF, o ra salvo em 0(sp)). O FATAL
+    // "Heap overrun" imprime os maiores consumidores do heap cheio.
+    struct LiveAlloc
+    {
+        uint32_t heap, size;
+        uint64_t site;
+    };
+    std::mutex g_trackMutex;
+    std::unordered_map<uint32_t, LiveAlloc> g_live;
+    std::unordered_map<uint32_t, std::string> g_freedBy; // ptr -> cadeia do ultimo free (liberacao dupla)
+    bool g_heapTrack = false;
+    PS2Runtime::RecompiledFunction g_origHeapAlloc = nullptr;
+
+    // Palavras da pilha que parecem endereco de retorno (codigo 0x100000..0x500000): a cadeia de chamadores.
+    std::string stackChain(uint8_t *rdram, uint32_t sp)
+    {
+        std::string chain;
+        for (uint32_t off = 0, n = 0; off < 0x400u && n < 12u; off += 4u)
+        {
+            uint32_t w = 0;
+            std::memcpy(&w, rdram + ((sp + off) & 0x1FFFFFFu), 4);
+            if (w >= 0x00100000u && w < 0x00500000u && (w & 3u) == 0u)
+            {
+                char b[16];
+                std::snprintf(b, sizeof(b), " 0x%x", w);
+                chain += b;
+                ++n;
+            }
+        }
+        return chain;
+    }
+
+    void trackedHeapAlloc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (!g_heapTrack)
+        {
+            g_origHeapAlloc(rdram, ctx, runtime);
+            return;
+        }
+        const uint32_t heap = GPR_U32(ctx, 4), size = GPR_U32(ctx, 5), ra = GPR_U32(ctx, 31);
+        uint32_t ra2 = 0;
+        if (ra >= 0x00219E70u && ra < 0x0021A000u)
+            std::memcpy(&ra2, rdram + (GPR_U32(ctx, 29) & 0x1FFFFFFu), 4);
+        // malloc alinhado FUN_0025C6A0 (frame 0x10, ra em 8) chama FUN_00219F20 (frame 0x10): o chamador real
+        // fica em sp+0x18.
+        uint32_t ra3 = 0;
+        if (ra2 == 0x0025C6C4u)
+            std::memcpy(&ra3, rdram + ((GPR_U32(ctx, 29) + 0x18u) & 0x1FFFFFFu), 4), ra2 = ra3;
+        if (size >= 0x100000u)
+            std::fprintf(stderr, "[rdr] alocacao grande: heap=0x%x %u bytes ra=0x%x via=0x%x%s pilha:%s\n", heap, size, ra, ra2,
+                         ra3 ? " (malloc alinhado)" : "", stackChain(rdram, GPR_U32(ctx, 29)).c_str());
+        g_origHeapAlloc(rdram, ctx, runtime);
+        const uint32_t ptr = GPR_U32(ctx, 2);
+        if (ptr == 0u)
+            return;
+        std::lock_guard<std::mutex> lock(g_trackMutex);
+        g_live[ptr] = {heap, size, (static_cast<uint64_t>(ra2) << 32) | ra};
+        g_freedBy.erase(ptr);
+        uint32_t levelHeap = 0;
+        std::memcpy(&levelHeap, rdram + 0x0079DF1Cu, 4);
+        static int s_levelLog = 0;
+        if (heap == levelHeap && s_levelLog++ < 400)
+            std::fprintf(stderr, "[lh] +%u ptr=0x%x ra=0x%x via=0x%x topo=%u\n", size, ptr, ra, ra2,
+                         [&] { uint32_t t = 0; std::memcpy(&t, rdram + ((heap + 0xCu) & 0x1FFFFFFu), 4); return t; }());
+    }
+
+    void dumpHeapConsumers(uint32_t heap)
+    {
+        std::lock_guard<std::mutex> lock(g_trackMutex);
+        std::map<uint64_t, std::pair<uint64_t, uint32_t>> bySite;
+        for (const auto &[ptr, a] : g_live)
+            if (a.heap == heap)
+                bySite[a.site].first += a.size, ++bySite[a.site].second;
+        std::vector<std::pair<uint64_t, std::pair<uint64_t, uint32_t>>> v(bySite.begin(), bySite.end());
+        std::sort(v.begin(), v.end(), [](const auto &x, const auto &y) { return x.second.first > y.second.first; });
+        for (size_t i = 0; i < v.size() && i < 15u; ++i)
+            std::fprintf(stderr, "[rdr]   vivo: ra=0x%x via=0x%x  %llu bytes em %u blocos\n", static_cast<uint32_t>(v[i].first),
+                         static_cast<uint32_t>(v[i].first >> 32), static_cast<unsigned long long>(v[i].second.first), v[i].second.second);
+    }
+
+    void checkedHeapFree(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        auto rd = [rdram](uint32_t a) { uint32_t v = 0; std::memcpy(&v, rdram + (a & 0x1FFFFFFu), 4); return v; };
+        const uint32_t heap = GPR_U32(ctx, 4), ptr = GPR_U32(ctx, 5), ra = GPR_U32(ctx, 31);
+        std::string prevFree;
+        if (g_heapTrack && ptr != 0u)
+        {
+            std::lock_guard<std::mutex> lock(g_trackMutex);
+            auto it = g_live.find(ptr);
+            uint32_t levelHeap = 0;
+            std::memcpy(&levelHeap, rdram + 0x0079DF1Cu, 4);
+            static int s_levelFreeLog = 0;
+            if (it != g_live.end() && it->second.heap == levelHeap && s_levelFreeLog++ < 400)
+                std::fprintf(stderr, "[lh] -%u ptr=0x%x heap=0x%x ra=0x%x\n", it->second.size, ptr, heap, ra);
+            prevFree = it == g_live.end() ? (g_freedBy.count(ptr) ? "ja liberado por" + g_freedBy[ptr] : "nunca alocado") : "vivo";
+            if (it != g_live.end())
+                g_live.erase(it);
+            g_freedBy[ptr] = stackChain(rdram, GPR_U32(ctx, 29));
+        }
+        const bool checks = rdram[(heap + 0x1Cu) & 0x1FFFFFFu] && rdram[(heap + 0x1Du) & 0x1FFFFFFu] &&
+                            !rdram[(heap + 0x1Eu) & 0x1FFFFFFu];
+        if (ptr == 0u || !checks)
+        {
+            g_origHeapFree(rdram, ctx, runtime);
+            return;
+        }
+        // O free de subpool FUN_00219A10 devolve o bloco de um subpool vazio (15424 bytes) por aqui (retorno
+        // 0x219AEC). Tentar os subpools com esse ponteiro "liberava" um slot do proprio bloco e ele nunca voltava ao
+        // heap: ~15 KB perdidos por ciclo da descompressao zlib, "Heap overrun" no loading do hng.
+        const bool fromSubpool = ra == 0x00219AECu;
+        for (uint32_t pool = 0xE4u; !fromSubpool && pool <= 0x10Cu; pool += 8u)
+        {
+            SET_GPR_U32(ctx, 4, heap + pool);
+            SET_GPR_U32(ctx, 5, ptr);
+            SET_GPR_U32(ctx, 6, heap);
+            g_subpoolFree(rdram, ctx, runtime);
+            if (GPR_U32(ctx, 2) != 0u)
+            {
+                SET_GPR_U32(ctx, 31, ra);
+                return;
+            }
+        }
+        SET_GPR_U32(ctx, 31, ra);
+        SET_GPR_U32(ctx, 4, heap);
+        SET_GPR_U32(ctx, 5, ptr);
+
+        const uint32_t base = rd(heap + 4u), end = base + rd(heap + 0xCu), blk = ptr - 0x10u;
+        bool ok = blk >= base && blk < end && (rd(blk) & 1u) != 0u; // bit 0 = em uso
+        if (ok && blk != base)
+        {
+            const uint32_t prev = rd(blk) & ~7u;
+            ok = prev >= base && prev + ((rd(prev + 4u) + 0xFu) & ~0xFu) + 0x10u == blk;
+        }
+        if (ok)
+        {
+            const uint32_t next = blk + ((rd(blk + 4u) + 0xFu) & ~0xFu) + 0x10u;
+            ok = next == end || (next < end && (rd(next) & ~7u) == blk);
+        }
+        if (!ok)
+        {
+            static int s_logged = 0;
+            if (s_logged++ < 32)
+                std::fprintf(stderr, "[rdr] free invalido ignorado: ptr=0x%x heap=0x%x chamador=0x%x hdr=0x%x,0x%x\n", ptr,
+                             heap, rd(GPR_U32(ctx, 29) + 8u), rd(blk), rd(blk + 4u));
+            if (g_heapTrack)
+                std::fprintf(stderr, "[rdr]   agora:%s\n[rdr]   antes: %s\n", stackChain(rdram, GPR_U32(ctx, 29)).c_str(),
+                             prevFree.c_str());
+            return;
+        }
+        g_origHeapFree(rdram, ctx, runtime);
+    }
+
+    // Player de FMV (FUNCOES.md #82): FUN_002361B0(nomes[], n, ...) monta "cdrom0:/pss/<nome>.pss" para cada nome.
+    // Registra os videos tocados e, com RDR_FMV_REDIRECT=DE=PARA (ex.: rslogo=bridge01), troca o nome; usado por
+    // tools/fmv_audio_test.ps1 para testar o som de cada video sem navegar no jogo.
+    PS2Runtime::RecompiledFunction g_origFmvPlay = nullptr;
+
+    void fmvPlayWithRedirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t names = GPR_U32(ctx, 4), count = GPR_U32(ctx, 5);
+        const char *rule = std::getenv("RDR_FMV_REDIRECT");
+        const std::string ruleStr = rule ? rule : "";
+        const size_t eq = ruleStr.find('=');
+        for (uint32_t i = 0; i < count && i < 16u; ++i)
+        {
+            uint32_t ptr = 0;
+            std::memcpy(&ptr, rdram + ((names + i * 4u) & 0x1FFFFFFu), 4);
+            const std::string name(reinterpret_cast<const char *>(rdram + (ptr & 0x1FFFFFFu)));
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (eq != std::string::npos && lower == ruleStr.substr(0, eq))
+            {
+                const std::string to = ruleStr.substr(eq + 1u);
+                const uint32_t guest = runtime->guestMalloc(static_cast<uint32_t>(to.size() + 1u), 16u);
+                if (guest)
+                {
+                    std::memcpy(rdram + (guest & 0x1FFFFFFu), to.c_str(), to.size() + 1u);
+                    std::memcpy(rdram + ((names + i * 4u) & 0x1FFFFFFu), &guest, 4);
+                    std::fprintf(stderr, "[rdr] fmv %s -> %s\n", name.c_str(), to.c_str());
+                    continue;
+                }
+            }
+            std::fprintf(stderr, "[rdr] fmv %s\n", name.c_str());
+        }
+        g_origFmvPlay(rdram, ctx, runtime);
+    }
+
+    // Carga de fase (FUNCOES.md #83): FUN_00228120(reg) le o nome em reg+4 (reg 0 = fase atual em 0x79DEA0) e abre
+    // LVLS_SNG/<NOME>.DAT. Registra cada fase e, com RDR_LEVEL_REDIRECT=DE=PARA (ex.: sher70=bridge), troca o nome
+    // antes da carga; usado por tools/level_audio_test.ps1 (Novo jogo -> fase escolhida no lugar do tutorial).
+    PS2Runtime::RecompiledFunction g_origLevelLoad = nullptr;
+
+    void levelLoadWithRedirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t rec = GPR_U32(ctx, 4) ? GPR_U32(ctx, 4) : 0x0079DEA0u;
+        char *name = reinterpret_cast<char *>(rdram + ((rec + 4u) & 0x1FFFFFFu));
+        std::string lower(name, strnlen(name, 16));
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+        const char *rule = std::getenv("RDR_LEVEL_REDIRECT");
+        const std::string ruleStr = rule ? rule : "";
+        const size_t eq = ruleStr.find('=');
+        if (eq != std::string::npos && lower == ruleStr.substr(0, eq) && ruleStr.size() - eq - 1u <= 8u)
+        {
+            const std::string to = ruleStr.substr(eq + 1u);
+            std::memcpy(name, to.c_str(), to.size() + 1u);
+            std::fprintf(stderr, "[rdr] fase %s -> %s\n", lower.c_str(), to.c_str());
+        }
+        else
+        {
+            std::fprintf(stderr, "[rdr] fase %s\n", lower.c_str());
+        }
+        g_origLevelLoad(rdram, ctx, runtime);
+    }
+
+    // Erro fatal do motor (FUNCOES.md #85): FUN_0019A898(fmt, ...) formata "FATAL: %s" num printf que nao chega
+    // ao log e entra num laco infinito (a tela de loading fica parada). Registra a mensagem antes de chamar o original.
+    PS2Runtime::RecompiledFunction g_origFatal = nullptr;
+
+    void fatalWithLog(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        auto str = [rdram](uint32_t a) { return std::string(reinterpret_cast<const char *>(rdram + (a & 0x1FFFFFFu)), strnlen(reinterpret_cast<const char *>(rdram + (a & 0x1FFFFFFu)), 200)); };
+        const std::string fmt = str(GPR_U32(ctx, 4));
+        const int regs[] = {5, 6, 7, 8, 9, 10, 11};
+        std::string out;
+        int arg = 0;
+        for (size_t i = 0; i < fmt.size(); ++i)
+        {
+            if (fmt[i] != '%' || i + 1 >= fmt.size())
+            {
+                out += fmt[i];
+                continue;
+            }
+            size_t j = i + 1;
+            while (j < fmt.size() && std::strchr("0123456789.-lh", fmt[j]))
+                ++j;
+            const char conv = j < fmt.size() ? fmt[j] : 's';
+            const uint32_t v = arg < 7 ? GPR_U32(ctx, regs[arg]) : 0u;
+            ++arg;
+            char buf[32];
+            if (conv == 's')
+                out += str(v);
+            else if (conv == 'x' || conv == 'X' || conv == 'p')
+                std::snprintf(buf, sizeof(buf), "%x", v), out += buf;
+            else if (conv == '%')
+                out += '%', --arg;
+            else
+                std::snprintf(buf, sizeof(buf), "%d", static_cast<int32_t>(v)), out += buf;
+            i = j;
+        }
+        std::fprintf(stderr, "[rdr] FATAL do jogo: %s (chamador=0x%x) sp=0x%x pilha:%s\n", out.c_str(), GPR_U32(ctx, 31),
+                     GPR_U32(ctx, 29), stackChain(rdram, GPR_U32(ctx, 29)).c_str());
+        // "Heap overrun" vem do alocador FUN_00218860 (heap: +4 base, +8 tamanho, +0xC topo; listas livres em
+        // +0x20 + 4*i encadeadas por bloco[5], tamanho em bloco[1]). O heap fica num registrador salvo (s0..s7):
+        // imprime os que parecem heap, com o total livre nas listas (fragmentacao x falta de memoria).
+        auto rd = [rdram](uint32_t a) { uint32_t v = 0; std::memcpy(&v, rdram + (a & 0x1FFFFFFu), 4); return v; };
+        for (int r = 16; r <= 23; ++r)
+        {
+            const uint32_t h = GPR_U32(ctx, r);
+            if (h < 0x00100000u || h >= 0x02000000u)
+                continue;
+            const uint32_t base = rd(h + 4u), size = rd(h + 8u), top = rd(h + 0xCu);
+            if (base < 0x00100000u || base >= 0x02000000u || size == 0u || size > 0x02000000u || top > size + 0x100000u)
+                continue;
+            uint64_t freeBytes = 0, freeBlocks = 0, largest = 0;
+            for (uint32_t i = 0; i < 32u; ++i)
+                for (uint32_t b = rd(h + 0x20u + 4u * i), guard = 0; b != 0u && guard < 200000u; b = rd(b + 0x14u), ++guard)
+                {
+                    const uint32_t sz = rd(b + 4u);
+                    freeBytes += sz;
+                    ++freeBlocks;
+                    largest = std::max<uint64_t>(largest, sz);
+                }
+            std::fprintf(stderr, "[rdr]   heap? $%d=0x%x base=0x%x tamanho=%u topo=%u livre=%llu em %llu blocos (maior %llu)\n", r, h, base,
+                         size, top, static_cast<unsigned long long>(freeBytes), static_cast<unsigned long long>(freeBlocks),
+                         static_cast<unsigned long long>(largest));
+            if (g_heapTrack)
+                dumpHeapConsumers(h);
+        }
+        if (g_heapTrack)
+        {
+            const uint32_t levelHeap = rd(0x0079DF1Cu);
+            std::fprintf(stderr, "[rdr]   heap da fase 0x%x (topo=%u):\n", levelHeap, rd(levelHeap + 0xCu));
+            dumpHeapConsumers(levelHeap);
+        }
+        std::fflush(stderr);
+        g_origFatal(rdram, ctx, runtime);
+    }
+
+    // Saida pelo botao de voltar no menu principal (FUNCOES.md #86). Os prompts do rodape vem de FRONT.DAT
+    // frontendbuttons.swui (tabela ButtonPromptTable): no escritorio (modos book/poster/journal) so havia
+    // "X Enter" e "Options" no meio, com as setas nos cantos. FUN_00105290(tela, nome) le o .swui linha a linha e
+    // FUN_001054C8(tela, linha) interpreta as tags <...> da linha (varias por linha). As linhas sao trocadas 1:1:
+    // dois comentarios viram os elementos novos (3 botoes centralizados) e os grupos/tabela dos modos do
+    // escritorio passam a usa-los, com "voltar Quit" como 3o prompt. FUN_00123AE0(tela, modo) troca o modo dos
+    // prompts: nos modos do escritorio o runtime abre "Quit game?" ao apertar voltar.
+    PS2Runtime::RecompiledFunction g_origSwuiLoad = nullptr;
+    PS2Runtime::RecompiledFunction g_origSwuiLine = nullptr;
+    PS2Runtime::RecompiledFunction g_origPromptMode = nullptr;
+    bool g_inFrontendButtons = false;
+
+    void swuiLoadTracked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const char *name = reinterpret_cast<const char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
+        g_inFrontendButtons = std::strncmp(name, "frontendbuttons", 16) == 0;
+        g_origSwuiLoad(rdram, ctx, runtime);
+    }
+
+    std::string roomPromptLine(const std::string &line)
+    {
+        // x dos 3 botoes; o texto fica 30 px a direita, como no original. Quit no lado direito (pedido do usuario),
+        // mas antes da seta da direita (502..597); a da esquerda vai ate 130.
+        // Options 14 px a esquerda: os espacos Enter-Options e Options-Quit ficam iguais (pedido do usuario).
+        static const int kX[3] = {150, 266, 410};
+        static const char *const kButton[3] = {"BUTTON_CONFIRM", "BUTTON_ALT1_OPTIONS", "BUTTON_BACK"};
+        static const char *const kPrompt[3] = {"Enter", "Options", "Quit"};
+        const std::string font = "<FONT:berrylium:SCALE:0.750,0.750>";
+        auto texts = [&](const char *prefix, int dx, const char *const *values) {
+            std::string s = font;
+            for (int i = 0; i < 3; ++i)
+                s += "<TEXT:" + std::to_string(kX[i] + dx) + ",388,0:NAME:" + prefix + std::to_string(i) + ":" + values[i] + ">";
+            return s;
+        };
+        const std::string members = "BUTTONR0:PROMPTR0:BUTTONR1:PROMPTR1:BUTTONR2:PROMPTR2";
+        const std::string old = "BUTTON0:PROMPT0:BUTTON1:PROMPT1:BUTTON2:PROMPT2:BUTTON3:PROMPT3";
+        if (line == ";; storymode / poster layout")
+            return texts("BUTTONR", 0, kButton);
+        if (line == "; book arrow layout")
+            return texts("PROMPTR", 30, kPrompt);
+        for (const char *layout : {"layout_book", "layout_poster", "layout_journal"})
+        {
+            const std::string head = std::string("<GROUP:") + layout + ":nodata:10:";
+            if (line.rfind(head, 0) == 0 && line.compare(head.size(), old.size(), old) == 0)
+                return std::string("<GROUP:") + layout + ":nodata:8:" + members + line.substr(head.size() + old.size());
+        }
+        for (const char *mode : {"book", "poster", "journal"})
+        {
+            const std::string head = std::string("<LOOKUPDATA:") + mode + ",";
+            if (line.rfind(head, 0) != 0)
+                continue;
+            // colunas: modo, layout, 4 pares botao/texto, setas; os pares viram 3 (Enter, Options, Quit)
+            std::vector<std::string> cols;
+            size_t start = head.size() - 1u;
+            for (size_t p = start + 1u; p <= line.size(); ++p)
+                if (p == line.size() || line[p] == ',' || line[p] == '>')
+                {
+                    std::string c = line.substr(start + 1u, p - start - 1u);
+                    c.erase(0, c.find_first_not_of(" \t"));
+                    cols.push_back(c);
+                    start = p;
+                    if (p < line.size() && line[p] == '>')
+                        break;
+                }
+            if (cols.size() != 11u)
+                return {};
+            std::string s = head + "\t" + cols[0];
+            for (int i = 0; i < 3; ++i)
+                s += std::string(",\t") + kButton[i] + ",\t" + kPrompt[i];
+            return s + ",\t" + cols[9] + ",\t" + cols[10] + ">";
+        }
+        return {};
+    }
+
+    void swuiLineRewrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (g_inFrontendButtons)
+        {
+            char *buf = reinterpret_cast<char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
+            std::string line(buf, strnlen(buf, 255));
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+                line.pop_back();
+            const std::string repl = roomPromptLine(line);
+            if (!repl.empty() && repl.size() < 255u) // o buffer da linha (FUN_00105290) tem 256 bytes
+            {
+                std::memcpy(buf, repl.c_str(), repl.size() + 1u);
+                std::fprintf(stderr, "[rdr] frontendbuttons: %s\n", repl.c_str());
+            }
+        }
+        g_origSwuiLine(rdram, ctx, runtime);
+    }
+
+    void promptModeTracked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const char *p = reinterpret_cast<const char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
+        const std::string mode(p, strnlen(p, 32));
+        static std::string s_last;
+        if (mode != s_last)
+        {
+            s_last = mode;
+            std::fprintf(stderr, "[rdr] prompts %s\n", mode.c_str());
+        }
+        ps2SetBackExitEnabled(mode == "book" || mode == "poster" || mode == "journal");
+        g_origPromptMode(rdram, ctx, runtime);
+    }
+
     void applyRdrOverrides(PS2Runtime &runtime)
     {
+        // Padrao ligado; RDR_CHECKED_FREE=0 desliga (FUNCOES.md #80).
+        if (!(std::getenv("RDR_CHECKED_FREE") && std::getenv("RDR_CHECKED_FREE")[0] == '0'))
+        {
+            g_origHeapFree = runtime.lookupFunction(0x00218DD8u);
+            g_subpoolFree = runtime.lookupFunction(0x00219A10u);
+            runtime.replaceFunction(0x00218DD8u, checkedHeapFree);
+        }
+        g_heapTrack = std::getenv("RDR_HEAP_TRACK") && std::getenv("RDR_HEAP_TRACK")[0] == '1';
+        if (g_heapTrack)
+        {
+            g_origHeapAlloc = runtime.lookupFunction(0x00218860u);
+            runtime.replaceFunction(0x00218860u, trackedHeapAlloc);
+        }
+        if (!(std::getenv("RDR_SHOW_MC_POPUPS") && std::getenv("RDR_SHOW_MC_POPUPS")[0] == '1'))
+        {
+            g_origPopupGetVar = runtime.lookupFunction(0x00103428u);
+            runtime.replaceFunction(0x00103428u, popupAutoAccept);
+            g_origPopupSetVar = runtime.lookupFunction(0x00103478u);
+            runtime.replaceFunction(0x00103478u, popupSetVarNoMcNotice);
+        }
+        if (!(std::getenv("RDR_SHOW_PAD") && std::getenv("RDR_SHOW_PAD")[0] == '1'))
+            runtime.replaceFunction(0x0015B6C0u, skipTutorialPadDraw);
+        g_origFatal = runtime.lookupFunction(0x0019A898u);
+        runtime.replaceFunction(0x0019A898u, fatalWithLog);
+        g_origLevelLoad = runtime.lookupFunction(0x00228120u);
+        runtime.replaceFunction(0x00228120u, levelLoadWithRedirect);
+        g_origFmvPlay = runtime.lookupFunction(0x002361B0u);
+        runtime.replaceFunction(0x002361B0u, fmvPlayWithRedirect);
+        g_origSwuiLoad = runtime.lookupFunction(0x00105290u);
+        runtime.replaceFunction(0x00105290u, swuiLoadTracked);
+        g_origSwuiLine = runtime.lookupFunction(0x001054C8u);
+        runtime.replaceFunction(0x001054C8u, swuiLineRewrite);
+        g_origPromptMode = runtime.lookupFunction(0x00123AE0u);
+        runtime.replaceFunction(0x00123AE0u, promptModeTracked);
+        ps2SetQuitDialogDrawer(rdrDrawQuitDialog);
+        loadExtraArgs();
+        if (std::getenv("RDR_TRACE_PARAMS"))
+        {
+            g_origParamLookup = runtime.lookupFunction(0x0025C0C8u);
+            runtime.replaceFunction(0x0025C0C8u, traceParamLookup);
+        }
+        if (!g_extraArgs.empty())
+        {
+            g_origParseArgs = runtime.lookupFunction(0x0025A070u);
+            g_guestMalloc = runtime.lookupFunction(0x00219E70u);
+            runtime.replaceFunction(0x0025A070u, parseArgsWithExtras);
+        }
+        if (std::find(g_extraArgs.begin(), g_extraArgs.end(), "-unlockall") != g_extraArgs.end() ||
+            std::find(g_extraArgs.begin(), g_extraArgs.end(), "-lvlaccess") != g_extraArgs.end())
+        {
+            g_origBookUpdate = runtime.lookupFunction(0x0011B0F0u);
+            runtime.replaceFunction(0x0011B0F0u, bookUpdateAllChapters);
+            std::fprintf(stderr, "[rdr] livro de capitulos: todos liberados\n");
+        }
         if (const char *dt = std::getenv("RDR_FIXED_DT"))
             g_fixedDt = static_cast<float>(std::atof(dt));
         if (g_fixedDt > 0.0f)
@@ -301,6 +989,9 @@ namespace
         ps2_stubs::setMpegDemuxBlockOnBackpressure(true);
         // O jogo le o .PSS com sceCdRead (sem sceCdSt): o fim do video vem do codigo de fim de programa. FUNCOES.md #14.
         ps2_stubs::setMpegProgramEndIsEof(true);
+        // Callbacks de stream na thread leitora (FUNCOES.md #84): na fila iam para a thread principal com a trava
+        // do anel de audio do player tomada e as duas threads paravam no mesmo semaforo (ATTRACT.PSS / demo mode).
+        ps2_stubs::setMpegStreamCallbacksOnCaller(true);
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
         const std::filesystem::path image = findCdImage(paths.elfDirectory);
         if (image.empty())
@@ -309,7 +1000,15 @@ namespace
             return;
         }
         paths.cdImage = image;
+        // Saves em Documentos\Red Dead Revolver (como o GTA Vice City); RDR_SAVE_DIR troca (testes automaticos).
+        if (const char *saveEnv = std::getenv("RDR_SAVE_DIR"); saveEnv && saveEnv[0] != '\0')
+            paths.mcRoot = std::filesystem::path(saveEnv);
+        else if (const std::filesystem::path docs = rdrDocumentsDirectory(); !docs.empty())
+            paths.mcRoot = docs / "Red Dead Revolver";
+        std::error_code mcEc;
+        std::filesystem::create_directories(paths.mcRoot, mcEc);
         PS2Runtime::setIoPaths(paths);
+        std::cerr << "[rdr] saves: " << paths.mcRoot.string() << std::endl;
         std::cerr << "[rdr] CD image: " << PS2Runtime::getIoPaths().cdImage.string() << std::endl;
     }
 }

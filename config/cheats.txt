@@ -1,0 +1,9 @@
+# Trapacas do menu de debug (F11, aba Trapacas). Formato: nome;endereco;tipo;valor
+# tipo = u8 | u16 | u32 | f32. "valor" e o valor usado ao congelar (vazio = o valor atual no momento).
+# O menu acrescenta aqui os candidatos salvos com S (nome "novo_<endereco>"): renomeie os confirmados e
+# registre-os em docs/MEMORIA.md. Enderecos valem so para o ELF SLUS-20500 v1.03 (CRC32 EF570C27).
+novo_0000000c;0x0000000c;u32;0
+novo_00000010;0x00000010;u32;0
+novo_00000014;0x00000014;u32;0
+novo_00000018;0x00000018;u32;0
+novo_00000034;0x00000034;u32;0

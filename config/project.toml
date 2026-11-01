@@ -60,9 +60,8 @@ stubs = [
   "sceMpegIsEnd@0x00493468",
   "sceMpegReset@0x00493478",
   "sceMpegDelete@0x00493400",
-  # Lote 4 (FUNCOES.md #8): libsdr usada so pelo player de FMV (posicao do BlockTrans nao avancava)
-  "sceSdRemoteInit@0x0049AFE8",
-  "sceSdRemote@0x0049B128",
+  # Lote 4 (FUNCOES.md #8) removido em #82: com o SDRDRV.IRX emulado e o SPU2 (#81) a libsdr original
+  # fala com o IOP de verdade e o audio dos videos chega ao SPU2 (AutoDMA do nucleo 1).
   # FUNCOES.md #9: callback M2V do player de FMV (o HLE de MPEG decodifica sozinho; o anel de video do
   # jogo nao tem consumidor e travava a thread leitora dentro do sceMpegDemuxPss)
   "ret1@0x00471158",

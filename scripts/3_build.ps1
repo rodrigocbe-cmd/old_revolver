@@ -1,4 +1,4 @@
-# Compila o runner nativo (ps2EntryRunner) com o C++ gerado em out/generated.
+﻿# Compila o runner nativo (ps2EntryRunner) com o C++ gerado em out/generated.
 # O runtime do PS2Recomp compila tudo que estiver em ps2xRuntime/src/runner/*.cpp e inclui
 # os headers gerados de ps2xRuntime/include (ambos ignorados pelo git do PS2Recomp).
 # -NoSync: nao recopia out/generated (retomar build interrompido). -Jobs N: limita o paralelismo.
@@ -27,7 +27,7 @@ if (-not $NoSync) {
     $pgs = Join-Path $RDR_ROOT 'external\parallel-gs'
     $pgsArg = if (Test-Path (Join-Path $pgs 'Granite\CMakeLists.txt')) { "-DPS2X_PARALLEL_GS_DIR=$pgs" } else { '-DPS2X_PARALLEL_GS_DIR=' }
     cmake -S $src -B $build -G Ninja "-DCMAKE_BUILD_TYPE=$Config" `
-        -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF $pgsArg
+        -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF $pgsArg "-DPS2X_APP_ICON_RC=$(Join-Path $RDR_ROOT 'assets\icon\icon.rc')"
     if ($LASTEXITCODE) { throw 'configuracao do CMake falhou' }
 }
 

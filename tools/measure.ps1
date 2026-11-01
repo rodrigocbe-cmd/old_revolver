@@ -32,7 +32,7 @@ if ($Scenario -eq 'gameplay') {
 }
 
 $gsName = if ($Gpu) { 'gpu' } else { 'software' }
-if ($Gpu) { $env:PS2X_GS_BACKEND = 'parallel' } else { Remove-Item Env:PS2X_GS_BACKEND -ErrorAction SilentlyContinue }
+if ($Gpu) { $env:PS2X_GS_BACKEND = 'parallel' } else { $env:PS2X_GS_BACKEND = 'software' }
 foreach ($kv in ($Env -split ',' | Where-Object { $_ })) {
     $k, $v = $kv -split '=', 2
     Set-Item -Path "Env:$($k.Trim())" -Value $v

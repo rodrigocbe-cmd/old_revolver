@@ -4,6 +4,55 @@ _Última atualização: 2026-10-15 (desktop, sessão noturna)_
 
 ## Marco atual
 
+**2026-10-29 (#72):** build estável ~26 fps no gameplay (256–264 FINISH/600), **GS na GPU por padrão** (o exe roda assim sem variáveis). Eliminação de flags mortas do VU1 confirmada como causa do travamento intermitente (3/7 contra 0/6, `tools/soak.ps1`); fica desligada. Para os próximos testes de estabilidade, use `tools/soak.ps1 -Runs N -Gpu`.
+
+**2026-10-28 (noite, #71):** build atual ~26–27 fps no gameplay, estável. Eliminação de flags mortas do VU1 desligada (travou o jogo 2/2; investigar com `--dead-flags`). Memória ao vivo: `tools/ee_mem.py` + `tools/mem_bisect.py` + `docs/MEMORIA.md`. O número 156 do HUD não reagiu a escrita direta (u32/s32/u16/f32): hipótese de que o HUD só redesenha em eventos; identificar vida/balas/dinheiro com mudanças reais durante o jogo (atirar, tomar dano) e `ee_mem.py next changed/dec`.
+
+**2026-10-28 (fim da tarde, #70):** gameplay com GPU **275 FINISH/600 (~27,5 fps)** com o GS assíncrono (submissão ao paraLLEl-GS numa thread própria); referência em `logs/baseline_gameplay_gpu.json`. `tools/drive.ps1` agora é guiado pela tela (título → Start, Demo Mode → Start, menu reconhecido pela aparência): com o jogo mais rápido os tempos fixos caíam na demo e a medição saía inválida (~520–600, demo).
+
+**2026-10-28 (tarde, #69):** IOP numa thread própria do host: gameplay com GPU **199 FINISH/600 (~20 fps)**, o degrau de 3 VBlanks por quadro. Referência em `logs/baseline_gameplay_gpu.json`. Próximo degrau: 30 fps (2 VBlanks) exige ~33% a menos de trabalho por quadro na thread do jogo; refazer o perfil.
+
+**2026-10-28 (fim da manhã, #68):** gameplay com GPU **152–153 FINISH/600 (~15 fps)**; referência em `logs/baseline_gameplay_gpu.json`. Hipótese: o jogo espera VBlank por quadro, então o FPS anda em degraus (153 ≈ 4 VBlanks por quadro; 3 VBlanks = 200/600 exigiria ~20% a menos de trabalho por quadro). IOP: o laço do LIBSD sumiu com o ritmo do AutoDMA; agora o IOP gasta o teto de 25% no laço de serviço do AGESND (`0x3d180–0x3d340`), que não pode cair para 5% (trava). Próximos: thread própria para o IOP; ou tornar nativo o laço de serviço do AGESND; e seguir enxugando o VU1 (lower/flags).
+
+**VU1 estático (2026-10-28, #67):** gameplay com GPU **139 FINISH/600 ticks (~13,9 fps)**, antes 74; verificado 160/160 contra o interpretador. Referência gravada em `logs/baseline_gameplay_gpu.json`. Perfil depois do VU1 estático (`logs/prof_20261028_075732`): thread do jogo = IOP 30%, VU1 30%, GIF/VIF/DMA 12%,
+código do jogo 12%. IOP: o tempo está no laço da thread de som do AGESND (`0x44040–0x44440`, carregado em base
+`0x3cb00`; varre 48 vozes e chama modmidi/modsein/modhsyn), acordada por `iWakeupThread` num timer de hardware
+(`timrman`) de 4167 µs = 240 Hz; o relógio do IOP emulado anda perto do real (~38,7 MHz), então é trabalho real
+interpretado, não laço em falso. Descartado: `PS2X_IOP_BUSY_PERCENT=10` (139 → 141, +1%). Caminhos: rodar o IOP
+numa thread própria do host (no PS2 ele é paralelo ao EE) ou recompilar estaticamente o código dos IRX; e
+continuar enxugando o VU1 estático (normalização de operandos, flags).
+Ferramenta nova: `tools/irx_dis.py <irx> <base> <ini> <fim>` desmonta um trecho do IRX e anota as importações
+(`--imports` lista os stubs).
+
+**Gargalo com o GS na GPU (2026-10-27, `tools/profile.ps1 -Gpu`, `logs/prof_20261027_204253`):** a thread
+do jogo passa **72% no VU1** (microprogramas compilados, mas ainda com a maquinaria de pipeline ciclo a ciclo do
+interpretador: `commitReadyPipelines`, `readyCycle`, flags FMAC, normalização de operandos), 10% esperando,
+7% no código do jogo, 5% IOP. Quase tudo vem do DMA do scratchpad → MFIFO → VIF1 → MSCAL. O GS deixou de ser o
+limite. Próximo passo: VU1 compilado com tempo resolvido na geração (latências/stalls calculados por
+`tools/vu1_recomp.py`, sem filas de pipeline em execução), verificado com `PS2X_VU1_COMPILED_VERIFY`.
+Alternativa menor: rodar o VU1 numa thread própria (no PS2 ele roda em paralelo ao EE), ganho máximo ~1,4x.
+
+**Pendente: trapaças (pedido do usuário, 2026-10-29):** transformar **todas as trapaças originais do jogo** (invulnerável, Dead Eye infinito, arma de ouro, morte súbita, sem HUD, dinheiro etc.; nomes `cheat_*` no ELF, #74) e as trapaças de PC (vida/balas/dinheiro do menu F11, #73) em opções acessíveis no port, sem precisar digitar códigos.
+
+**Som (2026-10-30, #81):** SPU2 emulado; sai som no menu (efeitos das vozes + PCM do mixer do AGESND pela AutoDMA). Vídeos com som desde o #82 (libsdr original → SDRDRV emulado → AutoDMA do núcleo 1). Falta: reverb, conferir música/streams, qualidade (interpolação linear).
+
+**Som e vídeos (2026-10-30 13h, #82–#85):** os 22 .PSS do disco foram testados com `tools/fmv_audio_test.ps1` (`logs/fmv_audio/resumo.txt`): todos com som em toda a duração. O ATTRACT (modo demonstração) travava no início; corrigido no #84, que era o travamento do demo mode. Fases: o teste automático (`tools/level_audio_test.ps1`, troca `hng` pela fase via `RDR_LEVEL_REDIRECT`) ainda não é confiável. Com o demo mode funcionando, o `drive.ps1` às vezes não detecta o menu e não aperta as teclas. Trocar `front` por uma fase no boot trava em `FUN_00228740` (`0x228840`). Numa execução, a carga do `hng` acabou no laço do FATAL `FUN_0019A898` (tela de loading parada). O #85 registra a mensagem; ela ainda não foi capturada. Próximo: ajustar a detecção do menu no `drive.ps1` depois do demo, rodar `level_audio_test.ps1` em todas as fases e capturar o `[rdr] FATAL do jogo`.
+
+**Versão de distribuição v0.1.0 (2026-10-31).** `tools\make_dist.ps1` gera `dist\RedDeadRevolver-v0.1.0\` (+ .zip, ~80 MB, sem arquivos do jogo). O `RedDeadRevolver.exe` abre um lançador (PLAY / SELECT ROM / QUIT) que instala a ISO do jogador em pastas por tipo (`movies audio data frontend levels extras system`, como o GTA Vice City) e roda o jogo pelo disco virtual `system\disc.vdisc`, em tela cheia na resolução do monitor com SSAA 16 e 16:9. Saves em `Documentos\Red Dead Revolver`. Também: Options centralizado, widescreen sempre ligado, menu do F10 removido, controle de PS2 dos tutoriais escondido, aviso de memory card da abertura pulado (FUNCOES #89–#91). Verificado: instalação a partir da ISO, boot pelo disco virtual, menu sem o aviso, tutorial sem o controle. Atualizado em 2026-11-01: dois exes (jogo direto e `RDR Launcher.exe`), desinstalador, atalhos no menu Iniciar, ícone, sem SSAA por padrão. Pendente: confirmar que o autosave grava na pasta de Documentos; desempenho da fase `sher70` (11–30 fps mesmo sem SSAA); travamento ao voltar ao menu e carregar outra fase (salto para 0x510000 / 0x8, `logs/run_20261101_100004_drive.log`); menu de configurações no estilo do GTA VC.
+
+**Resolvido (2026-10-31): loading do `hng` (capítulo 2) termina e a fase é jogável.** Três causas encadeadas: (a) pools fixos do runtime (RPC/TLS/bootmode) em 0x1F00000–0x1F31000, dentro do heap do jogo, e pilhas/heap do runtime na RAM do jogo — zeravam objetos (queda em `0x100744`) → área privada 0x40000–0x100000 (#88); (b) o override do free (#80) vazava o bloco de 15 KB de cada subpool esvaziado → Heap overrun no heap da fase durante a descompressão zlib → corrigido; (c) o free inválido de `0x1007EC` (`FUN_00100788`, cabeçalho zerado) ainda acontece e é ignorado pelo #80. Verificação: `logs/run_20261031_123703_drive.log` (Red jogando no hng aos 290 s). Pendente: `guest-branch:missing-target` com pc=0x8 no fim desse teste (depois de voltar ao menu e recarregar o hng) e a origem do free inválido.
+
+**Bloqueio anterior (2026-10-29 20h): loading da história trava (teste do usuário).** Após avançar normalmente na história, `NewLoadShow` (0x69E6C0) fica em +0x90 = 2 (carregando) para sempre; a thread carregadora (id 13, entry 0x2201E8) dorme no sema 7 e o laço principal segue. Antes disso o usuário viu um travamento no início da cutscene antes do tutorial, e duas rodadas automáticas fecharam com salto para 0x510000 (`guest-branch:missing-target`). Hipótese: notificação perdida entre EE e IOP com a thread de IOP (#70). RAM salva em `logs/ee_snap_loadhang_20261029.bin`; log `logs/play_20261029_201054.log`. `-SafeIop` trava no demo mode (thread do vídeo num laço WaitSema/SignalSema esperando o áudio, que sem a thread de IOP não avança): não usar. Achados: (1) demo mode, thread no flip esperando FINISH → contador de FINISH (#79, hipótese); (2) loading do capítulo 2 (HNG.DAT) → laço infinito do free com ponteiro inválido (#80, contorno que ignora a liberação e registra o chamador).
+
+**Pendente: voltar com ○ nos menus (pedido do usuário, 2026-10-29):** o jogo usa △ para voltar (livro "△ Back", perfis "△ Back" / "○ Remove Player"). Plano: só no front-end, trocar ○↔△ na leitura do controle e trocar os glifos 0xBC↔0xBE da fonte, para o ícone acompanhar. Falta achar a flag de "front-end ativo" (máquina de estados do jogo, ver bloqueio de 2026-10-16).
+
+**Pendente: ícones por dispositivo (pedido do usuário, 2026-10-29, #76):** teclado → ícones de teclas; controle de PS → ícones nativos; controle de Xbox → ícones de Xbox. Os ícones são glifos da fonte `berrylium` (0xBA ✕, 0xBC △, 0xBD □, 0xBE ○, 0x2020–0x2023 L1/R1/L2/R2). Caminho: interceptar a leitura de `berrylium_02.tex`/`_04.tex` (ou o upload da textura para o GS) e trocar os pixels desses glifos por versões desenhadas para teclado/Xbox na mesma paleta, conforme o último dispositivo usado. Falta mapear as fontes do HUD do jogo (SWAT.DAT; nomes `xButton`, `triangleButton`... no ELF).
+
+**Pular fases (2026-10-29, #74/#75):** no build final o `unlockall` só libera diário e multi; o livro de capítulos só deixa escolher capítulo no modo Bounty Hunter. O override força esse modo (página virou no teste). Antes: **Pular fases (2026-10-29, #74):** `config/params.txt` passa parâmetros do motor ao jogo; `unlockall` (padrão) libera capítulos, trapaças, diário, multi e dificuldades. Efeito no menu ainda a confirmar.
+
+**Menu do port (2026-10-27, #66):** F10 abre "Resume / Exit to Windows" por cima do jogo.
+**Saída pelo botão de voltar (2026-10-30, #86): feito.** No escritório do xerife o rodapé mostra ✕ Enter, ○ Options e △ Quit (este à direita). △ (V / Num 1) abre "Quit game?" Yes/No (padrão No); Yes fecha o jogo. Teste: `tools/test_quit_menu.ps1`. Pendente: confirmar que △ dentro de Options/livro não abre a caixa (o log só mostrou os modos `none` e `book`); trocar o botão de voltar para ○ (`backButtonPressed()` no runtime + glifos). O menu F10 (#66) continua como saída de emergência. O `drive.ps1` agora detecta o menu pelo log `[rdr] prompts book|poster|journal`.
+
 **GS na GPU (2026-10-22, #65):** paraLLEl-GS (Vulkan compute, `external/parallel-gs` @ `cc6184af7e0c`, LGPL-3.0)
 integrado como backend opcional: `PS2X_GS_BACKEND=parallel` (build com `PS2X_PARALLEL_GS_DIR`, passado pelo
 `3_build.ps1`). Boot → logos → FMV → menu renderizam na RTX 3060 sem erros Vulkan

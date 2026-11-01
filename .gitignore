@@ -4,6 +4,7 @@ out/
 generated/
 logs/
 CLAUDE.md
+OLLAMA.md
 *.iso
 *.elf
 *.bin
@@ -12,3 +13,14 @@ SLES_*
 SLPM_*
 *.irx
 *.IRX
+
+# versao de distribuicao (contem o executavel recompilado)
+dist/
+
+# imagens da colecao SteamGridDB (arte do jogo; vao so no pacote de distribuicao)
+assets/SGDB/
+
+# configuracao local do editor/agentes
+.vscode/
+.github/
+__pycache__/

@@ -1,0 +1,2 @@
+// Icone do executavel e da janela (o GLFW procura o recurso GLFW_ICON). Gerado de icon.png.
+GLFW_ICON ICON "icon.ico"

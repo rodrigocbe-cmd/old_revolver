@@ -27,6 +27,8 @@
 #include <vector>
 
 bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4]); // rdr_quit_dialog.cpp
+void rdrControlsLoad();                                                         // rdr_controls.cpp
+void rdrKeyIconsInstall(PS2Runtime &runtime);                                  // rdr_keyicons.cpp
 std::filesystem::path rdrDocumentsDirectory();                                 // rdr_win32.cpp
 
 namespace
@@ -712,6 +714,46 @@ namespace
         g_origLevelLoad(rdram, ctx, runtime);
     }
 
+    // Travamento 0x510000 (docs/ESTADO.md): o ra de FUN_00236568 (sp+0x98 do quadro de 0xB0) aparece trocado.
+    // Com RDR_GUARD_236568=1 o slot fica vigiado enquanto a funcao esta viva; o runtime registra quem o mudou.
+    PS2Runtime::RecompiledFunction g_origFrameUpdate = nullptr;
+
+    void frameUpdateGuarded(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t slot = GPR_U32(ctx, 29) - 0xB0u + 0x98u, ra = GPR_U32(ctx, 31);
+        // sp de entrada diferente do anterior (o laco principal chama sempre do mesmo nivel de pilha)
+        {
+            static uint32_t s_lastSp = 0;
+            static int s_spLogs = 0;
+            const uint32_t sp = GPR_U32(ctx, 29);
+            if (sp != s_lastSp && s_spLogs++ < 40)
+            {
+                int thread = 0, inv = 0;
+                ps2DiagCurrentGuest(thread, inv);
+                std::fprintf(stderr, "[guard] FUN_00236568 entrou com sp=0x%x (antes 0x%x) ra=0x%x thread=%d invocacoes=%d\n",
+                             sp, s_lastSp, GPR_U32(ctx, 31), thread, inv);
+            }
+            s_lastSp = sp;
+        }
+        // Reentrada com a guarda armada: outra execucao do laco principal enquanto a anterior esta suspensa
+        if (const uint32_t armed = ps2StackGuardAddr(); armed != 0u)
+        {
+            static int s_logged = 0;
+            if (s_logged++ < 20)
+            {
+                int thread = 0, inv = 0;
+                ps2DiagCurrentGuest(thread, inv);
+                std::fprintf(stderr, "[guard] reentrada em FUN_00236568: sp=0x%x ra=0x%x thread=%d invocacoes=%d (guarda ativa em 0x%x)\n",
+                             GPR_U32(ctx, 29), ra, thread, inv, armed);
+            }
+        }
+        std::memcpy(rdram + (slot & 0x1FFFFFCu), &ra, 4); // o prologo grava o mesmo valor
+        ps2SetSpExpectation(0x00236568u, 0x00236B58u, GPR_U32(ctx, 29) - 0xB0u);
+        ps2SetStackGuard(slot, ra);
+        g_origFrameUpdate(rdram, ctx, runtime);
+        ps2ClearStackGuard();
+    }
+
     // Erro fatal do motor (FUNCOES.md #85): FUN_0019A898(fmt, ...) formata "FATAL: %s" num printf que nao chega
     // ao log e entra num laco infinito (a tela de loading fica parada). Registra a mensagem antes de chamar o original.
     PS2Runtime::RecompiledFunction g_origFatal = nullptr;
@@ -916,6 +958,11 @@ namespace
         }
         if (!(std::getenv("RDR_SHOW_PAD") && std::getenv("RDR_SHOW_PAD")[0] == '1'))
             runtime.replaceFunction(0x0015B6C0u, skipTutorialPadDraw);
+        if (const char *g = std::getenv("RDR_GUARD_236568"); g && g[0] == '1')
+        {
+            g_origFrameUpdate = runtime.lookupFunction(0x00236568u);
+            runtime.replaceFunction(0x00236568u, frameUpdateGuarded);
+        }
         g_origFatal = runtime.lookupFunction(0x0019A898u);
         runtime.replaceFunction(0x0019A898u, fatalWithLog);
         g_origLevelLoad = runtime.lookupFunction(0x00228120u);
@@ -929,6 +976,8 @@ namespace
         g_origPromptMode = runtime.lookupFunction(0x00123AE0u);
         runtime.replaceFunction(0x00123AE0u, promptModeTracked);
         ps2SetQuitDialogDrawer(rdrDrawQuitDialog);
+        rdrControlsLoad();
+        rdrKeyIconsInstall(runtime);
         loadExtraArgs();
         if (std::getenv("RDR_TRACE_PARAMS"))
         {

@@ -343,14 +343,17 @@ namespace
 
     void setPlayDefaults(const fs::path &root, fs::path &elfOut, std::string &titleOut)
     {
-        // Tela cheia na resolucao do monitor, 16:9, sem SSAA: com SSAA (4 ou 16) as fases cairam para 9-28 fps numa
-        // RTX 3060 e o loading parecia travado. PS2X_GS_SSAA=4|16 liga (futuro menu de configuracoes).
+        // Tela cheia na resolucao do monitor, 16:9. Antes sem SSAA (o loading parecia travado, mas a causa eram as flags
+        // do lancador vazando para a janela do jogo, FUNCOES.md #89).
         int sw = 1920, sh = 1080;
         rdrNativeScreenSize(sw, sh);
         rdrSetEnvDefault("PS2X_DIST", "1");
         rdrSetEnvDefault("PS2X_FULLSCREEN", "1");
         rdrSetEnvDefault("PS2X_WINDOW_SIZE", std::to_string(sw) + "x" + std::to_string(sh));
         rdrSetEnvDefault("PS2X_ASPECT", "16:9");
+        // Qualidade (2026-11-01): SSAA 4 (2x por eixo) com texturas supersampled e saida na resolucao interna. SSAA 16
+        // deixou o tutorial em ~11 fps numa RTX 3060 em 4K (antes ~26). PS2X_GS_SSAA=1 desliga, 16 = maximo.
+        rdrSetEnvDefault("PS2X_GS_SSAA", "4");
         elfOut = root / "system" / "SLUS_205.00";
         titleOut = "Red Dead Revolver";
         // Saves em Documentos desde o inicio: o padrao do runtime (<pasta atual>\mc0) criava mc0/mc1 vazias na

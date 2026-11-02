@@ -418,3 +418,82 @@ Espaço: o disco extraído (2,2 GB) + C++ gerado + build com símbolos ocupam v�
 - Ghidra headless precisa de `JAVA_HOME` (o `env.ps1` define). Projeto: `out/ghidra/RDR.gpr`.
 - Ferramentas auxiliares temporárias (venv com capstone para desmontar) ficaram fora do projeto,
   no scratchpad da sessão; recriar se necessário (`pip install capstone`).
+
+**Investigação (2026-11-01 noite): travamento com salto para 0x510000 ao carregar fase.** É intermitente: em 7 rodadas de `tools/walk_test.ps1`, aconteceu 3 vezes, no front ou no carregamento do perfnew. Também já aparecia em logs de 29/10.
+
+O que se sabe:
+- A thread 1 retorna de `FUN_00236568` (atualização por quadro; quadro de 176 bytes, ra em sp+0x98 = `0x1F7FDA8`, perto do topo da pilha principal em `0x1F80000`) com o ra e os registradores salvos (s0, s1 = 0) corrompidos.
+- `0x510000` aparece de forma legítima nesse slot quando o quadro não está ativo.
+- **Descartado:** as pilhas de interrupção, que ficam na área privada `0x80000–0x100000`.
+- **Hipótese:** escrita fora do lugar perto do anel do MFIFO, que começa em `0x1F80000`, logo acima da pilha.
+
+Diagnóstico deixado no runtime (`EeScheduler.cpp`):
+- no PC inválido, o log mostra os últimos 24 despachos (pc/ra/sp) e a pilha em volta do sp;
+- `PS2X_WATCH=<end>:<valor>` registra as transições de uma palavra.
+
+Falta reproduzir de novo com o dump da pilha.
+
+**Travamento 0x510000: mecanismo (2026-11-01, `logs/run_20261101_215104_drive.log`).**
+
+O dump da pilha mostra:
+- o quadro do `FUN_00236568` com ra = `0x510000` em sp+0x98 (`0x1F7FDA8`);
+- o ra verdadeiro (`0x1018C8`, retorno da chamada em `0x1018C0` dentro de `FUN_001018A0`) 16 bytes acima, em `0x1F7FDB8`.
+
+Leitura: a thread 1 ficou bloqueada dentro de `FUN_00151960` (contexto salvo: pc `0x1516A0`, sp `0x1F7FD00`) e **continuou por outro caminho**. O loop chamou o `FUN_00236568` de novo, com sp 16 bytes acima, e o quadro novo cobriu o antigo. Depois o escalonador retomou o contexto velho, já obsoleto, e o retorno caiu em `0x510000`.
+
+O problema está no escalonador do runtime (`EeScheduler.cpp`): continuação duplicada da thread principal. Não é escrita errada na memória.
+
+Próximo passo: achar onde um contexto da thread 1 fica guardado e é retomado depois. Candidatos:
+- `GuestInvocation` (interrupções e callbacks, `invokeCurrent`/`m_pendingInvocations`);
+- bloqueio em syscall (`blockCurrent`);
+- `transferIfRequested`.
+
+Para isso, registrar a cada retomada da thread 1 o pc/sp retomado e o pc/sp da última vez que ela rodou.
+
+**2026-11-02: SSAA 16 e o travamento.**
+
+FPS com SSAA 16, em 4K numa RTX 3060:
+- tutorial a ~11 fps, com a GPU em 30–45% de uso e as threads da CPU esperando (`tools/profile.ps1`). Ou seja, serialização CPU↔GPU, não falta de GPU;
+- menu a ~28 fps (limitado pelo jogo a 30) com a GPU em ~70%.
+
+Correção feita: o `present` da ponte do paraLLEl-GS (`gs_parallel_bridge.cpp`) copiava a imagem e esperava a GPU (`fence->wait()`) a cada vsync. Agora a leitura é em buffer duplo: copia o quadro N, lê o N−1, com buffers fixos. `PS2X_GS_READBACK_SYNC=1` volta ao modo antigo. **Ganho ainda não medido no gameplay.**
+
+Travamento (PC inválido `0x510000` / `0x1A761B0` / `0x1A22294` na thread 1): em 6 de 8 rodadas, sempre logo depois da invocação da interrupção `0x3B94A8` sobre a thread 1 (`t-101` no anel). Ao fim dela, a thread 1 retoma com pc/ra errados.
+
+Descartado:
+- pilhas sobrepostas: `[CreateThread]` mostra cada thread com pilha própria, por exemplo a thread 2 em `0x795390`/0x2000;
+- reentrada do laço principal: a vigia `RDR_GUARD_236568` não registrou nenhuma.
+
+Próximo passo: na entrada e na saída de cada invocação de interrupção sobre uma thread, registrar o contexto da thread (pc, ra, sp e `in_delay_slot`). Também ver onde o código gerado lança a transferência (`invokeCurrent`/`transferIfRequested` dentro de stubs e syscalls) sem `ctx->pc`/ra coerentes.
+
+Ferramentas de diagnóstico:
+- anel de despachos com a thread de cada um;
+- dump da pilha no PC inválido;
+- `PS2X_WATCH`;
+- `RDR_GUARD_236568=1`;
+- log `[CreateThread]`.
+
+Medir o gameplay com save vazio: `-Env "RDR_SAVE_DIR=<pasta vazia>"`. Com o save de teste, o jogo para no menu antes da sher70, que não gera FINISH.
+
+**2026-11-02 (tarde): travamento, novas pistas.**
+
+`FUN_00236568`:
+- o laço principal **sempre** o chama com sp `0x1F7FDD0`, então o quadro real fica em `0x1F7FD20`, com o ra em `0x1F7FDB8`;
+- no travamento de 0x510000, a continuação rodou com **sp 16 bytes abaixo** (`0x1F7FD10`) e leu o ra no slot errado;
+- conclusão: alguma função chamada voltou ao escalonador com sp−16. Não é escrita errada na memória.
+
+Conferido no código gerado: o `jr ra` com `addiu sp` no delay slot e os checkpoints de laço (`eeCheckpointDue`) executam o delay slot antes de sair.
+
+Outros travamentos:
+- PC inválido `0x1F7FA50` e `0x1A22294`, com ra lido de um slot com dado de pilha ou de heap;
+- vêm logo depois da interrupção do FINISH do GS (`FUN_003B94A8`: `sceGsPutIMR`, `iSignalSema(DAT_007620C8)`, `EI`), que roda sobre a thread 1.
+
+Diagnóstico deixado no código:
+- `RDR_GUARD_236568=1`, que também arma `ps2SetSpExpectation`: o escalonador registra `[spcheck]` quando retoma dentro do `FUN_00236568` com sp diferente do esperado e mostra o despacho que devolveu o sp errado;
+- o log de entrada com sp diferente.
+
+Próximo passo:
+1. Rodar até um travamento em `FUN_00236568` com `[spcheck]`.
+2. Generalizar: guardar o sp de cada despacho de retorno e comparar com o sp do quadro que chamou.
+
+O override de leitura do Dave agora só age se a original terminou (`ctx->pc == ra`) e limita a cópia ao tamanho pedido (`a2`). Isso não era a causa do travamento.

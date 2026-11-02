@@ -1,6 +1,5 @@
-// Caixa "Quit game?" no estilo do Red Dead Revolver (FUNCOES.md #86): papel dos popups do jogo (popup_paper.tex),
-// titulo e opcoes na fonte regulatorcondensed (a dos titulos/opcoes das telas, ex.: mainoptions.swui) e prompts na
-// berrylium (com os icones dos botoes). Tudo lido do FRONT.DAT do disco do usuario em tempo de execucao
+// Caixa "Quit game?" no estilo do Red Dead Revolver (FUNCOES.md #86): igual ao popup do jogo ao sair de uma fase
+// (cartao preto do silentfilmpopup.tex, texto na berrylium, YES/NO na regulatorcondensed). Tudo lido do FRONT.DAT do disco do usuario em tempo de execucao
 // (na versao instalada, frontend/FRONT.DAT, achado pelo disc.vdisc).
 // Registrado no runtime por applyRdrOverrides (ps2SetQuitDialogDrawer); a entrada continua no runtime.
 
@@ -246,7 +245,7 @@ namespace
             std::fprintf(stderr, "[rdr] caixa de saida: %s nao abriu, usando a caixa simples\n", path.c_str());
             return false;
         }
-        g_assets.paper = loadTex(dave.file("popup_paper.tex"));
+        g_assets.paper = loadTex(dave.file("silentfilmpopup.tex"));
         g_assets.ok = g_assets.paper.id != 0 && g_assets.title.load(dave, "regulatorcondensed") &&
                       g_assets.prompt.load(dave, "berrylium");
         if (!g_assets.ok)
@@ -255,7 +254,9 @@ namespace
     }
 }
 
-// Coordenadas da tela do jogo (640x448) convertidas para a area da imagem na janela.
+// Coordenadas da tela do jogo (640x448) convertidas para a area da imagem na janela. Layout do popup do proprio
+// jogo ao sair de uma fase, com o texto "Quit the game?": cartao preto com o ornamento do
+// silentfilmpopup.tex, texto branco na berrylium e YES/NO na regulatorcondensed (selecionado branco, outro cinza).
 bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4])
 {
     if (!loadAssets())
@@ -263,47 +264,37 @@ bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4])
     const float sx = game[2] / 640.0f, sy = game[3] / 448.0f, s = std::min(sx, sy);
     auto X = [&](float x) { return game[0] + x * sx; };
     auto Y = [&](float y) { return game[1] + y * sy; };
+    // escala para a letra maiuscula ter a altura pedida (em pixels da tela do jogo)
+    auto fit = [&](const auto &f, uint16_t ref, float height) {
+        const auto *g = f.find(ref);
+        return g && g->h > 0 ? height * s / g->h : s;
+    };
 
-    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Fade(BLACK, 0.5f));
-    const Rectangle paper{X(150), Y(134), 340 * sx, 180 * sy};
-    DrawTexturePro(g_assets.paper, Rectangle{0, 0, static_cast<float>(g_assets.paper.width), static_cast<float>(g_assets.paper.height)},
-                   paper, Vector2{0, 0}, 0.0f, WHITE);
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Fade(BLACK, 0.35f));
+    const Rectangle card{X(161), Y(113), 320 * sx, 224 * sy};
+    DrawRectangleRec(card, BLACK);
+    // so o ornamento de cima da textura (a de baixo nao aparece no popup do jogo)
+    const float k = card.width / 512.0f;
+    DrawTexturePro(g_assets.paper, Rectangle{0, 0, 512, 48}, Rectangle{card.x, card.y + 14 * k, card.width, 48 * k},
+                   Vector2{0, 0}, 0.0f, WHITE);
 
-    // Marrom do titulo das telas do jogo (mainoptions.swui: BASECOLOR 0.289,0.041,0)
-    const Color ink{74, 10, 0, 255};
-    const Color faded{74, 10, 0, 120};
+    const Color white{235, 235, 230, 255}, gray{128, 128, 128, 255};
     const std::vector<uint16_t> title = chars("Quit the game?");
-    const float ts = 1.35f * s;
-    g_assets.title.draw(title, X(320) - g_assets.title.width(title, ts) / 2.0f, Y(192), ts, ink);
+    const float bs = fit(g_assets.prompt, 'Q', 20.0f);
+    g_assets.prompt.draw(title, X(320) - g_assets.prompt.width(title, bs) / 2.0f, Y(222), bs, white);
 
-    static const char *const kItems[2] = {"Yes", "No"};
-    const float is = 1.2f * s;
-    const double pulse = 0.75 + 0.25 * std::sin(GetTime() * 5.0);
+    static const char *const kItems[2] = {"YES", "NO"};
+    const float is = fit(g_assets.title, 'E', 38.0f);
     for (int i = 0; i < 2; ++i)
     {
         const std::vector<uint16_t> t = chars(kItems[i]);
         const float w = g_assets.title.width(t, is);
-        const float cx = X(i == 0 ? 260.0f : 380.0f);
-        const bool sel = i == selected;
-        Color c = sel ? Color{140, 20, 0, static_cast<uint8_t>(255 * pulse)} : faded;
-        g_assets.title.draw(t, cx - w / 2.0f, Y(242), is, c);
-        if (sel)
-            DrawRectangleRec(Rectangle{cx - w / 2.0f, Y(246), w, std::max(1.0f, 2.0f * sy)}, Color{140, 20, 0, 200});
+        const float cx = X(i == 0 ? 268.0f : 384.0f);
+        g_assets.title.draw(t, cx - w / 2.0f, Y(302), is, i == selected ? white : gray);
         items[i][0] = cx - 50 * sx;
-        items[i][1] = Y(214);
+        items[i][1] = Y(258);
         items[i][2] = 100 * sx;
-        items[i][3] = 40 * sy;
+        items[i][3] = 50 * sy;
     }
-
-    // Prompts como nas telas do jogo: [X] Select   [triangulo] Back (glifos 0xBA e 0xBC da berrylium)
-    const float ps = 0.75f * s;
-    std::vector<uint16_t> prompts = {0xBA, ' '};
-    for (uint16_t c : chars("Select    "))
-        prompts.push_back(c);
-    prompts.push_back(0xBC);
-    prompts.push_back(' ');
-    for (uint16_t c : chars("Back"))
-        prompts.push_back(c);
-    g_assets.prompt.draw(prompts, X(320) - g_assets.prompt.width(prompts, ps) / 2.0f, Y(286), ps, ink);
     return true;
 }

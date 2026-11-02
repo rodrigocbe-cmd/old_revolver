@@ -15,6 +15,7 @@ public static class D { [StructLayout(LayoutKind.Sequential)] public struct R { 
 [void][D]::SetProcessDPIAware()
 $env:PS2X_STATS = '1'   # contadores do [run:draws] (desligados por padrao no runtime)
 if (-not $env:RDR_SAVE_DIR) { $env:RDR_SAVE_DIR = Join-Path (Split-Path $PSScriptRoot -Parent) 'game\disc\mc0' }   # testes nao gravam em Documentos
+if (-not $env:RDR_CONTROLS) { $env:RDR_CONTROLS = 'legacy' }   # testes mandam as teclas antigas (X, V, Enter...)
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $log = "$root\logs\run_${stamp}_drive.log"
 $p = Start-Process "$root\out\build\ps2xRuntime\ps2EntryRunner.exe" -ArgumentList "`"$root\game\disc\SLUS_205.00`"" `

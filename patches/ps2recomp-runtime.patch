@@ -2240,7 +2240,7 @@ index 589d768..04812ea 100644
  
  # Vita: Work around for GCC 10's LTO plugin
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..e2eb458 100644
+index 4b9242c..08e0c02 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -237,6 +237,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
@@ -2289,7 +2289,7 @@ index 4b9242c..e2eb458 100644
  }
  
  class PS2Runtime
-@@ -551,4 +552,25 @@ extern const uint32_t g_ps2RecompiledFunctionTableEnd;
+@@ -551,4 +552,34 @@ extern const uint32_t g_ps2RecompiledFunctionTableEnd;
  extern const uint32_t g_ps2RecompiledFunctionTableSlotCount;
  extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
  
@@ -2306,6 +2306,15 @@ index 4b9242c..e2eb458 100644
 +
 +// Versao de distribuicao (PS2X_DIST=1): sem painel/menus de debug (F1, F9, F11).
 +bool ps2DistMode();
++// Diagnostico de pilha corrompida: a palavra em addr deve continuar valendo value; o escalonador confere a cada
++// despacho e registra quem mudou (uma vez por armacao). ps2ClearStackGuard desarma.
++void ps2SetStackGuard(uint32_t addr, uint32_t value);
++void ps2ClearStackGuard();
++uint32_t ps2StackGuardAddr();
++// Diagnostico: retomadas da thread em [lo, hi) devem ter sp == sp (o escalonador registra quando nao tem)
++void ps2SetSpExpectation(uint32_t lo, uint32_t hi, uint32_t sp);
++// Thread do EE e profundidade de invocacoes (interrupcoes/callbacks) do despacho em curso (diagnostico)
++void ps2DiagCurrentGuest(int &threadId, int &invocations);
 +
 +// Lancador do jogo antes do boot (game override, versao de distribuicao): pode mostrar a propria tela, instalar
 +// os arquivos e escolher o ELF e o titulo da janela. Retorna 1 = usar elfOut/titleOut, 0 = fluxo normal
@@ -2499,7 +2508,7 @@ index 0000000..052f2e8
 +    bool findFile(const std::filesystem::path &path, std::string_view isoPath, std::filesystem::path &hostFile);
 +}
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index f247ff9..4916e39 100644
+index f247ff9..c913c87 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -332,6 +332,7 @@ public:
@@ -2510,6 +2519,22 @@ index f247ff9..4916e39 100644
      void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
      [[nodiscard]] uint64_t currentVSyncTick() const noexcept;
      uint32_t setGsVSyncCallback(uint32_t callback, uint32_t gp, uint32_t sp);
+@@ -421,6 +422,15 @@ private:
+     uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
++    // Ultimos despachos (pc, ra, sp) para o relatorio de PC invalido
++    struct DispatchRecord
++    {
++        uint32_t pc = 0, ra = 0, sp = 0;
++        int thread = 0; // -100-id: invocacao sobre a thread id
++    };
++    static constexpr uint32_t kDispatchRing = 24;
++    DispatchRecord m_dispatchRing[kDispatchRing] = {};
++    uint32_t m_dispatchRingPos = 0;
+     bool m_rescheduleRequested = false;
+     bool m_timeSliceExpired = false;
+     bool m_insideInterrupt = false;
 diff --git a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h b/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
 index 2421f9e..b60968d 100644
 --- a/ps2xRuntime/include/runtime/gs/gs_cpu_backend.h
@@ -2650,6 +2675,48 @@ index 0000000..98ecb0d
 +}
 +
 +#endif // PS2_MPEG_OPTIONS_H
+diff --git a/ps2xRuntime/include/runtime/ps2_pad.h b/ps2xRuntime/include/runtime/ps2_pad.h
+index 7755fe6..569c0ba 100644
+--- a/ps2xRuntime/include/runtime/ps2_pad.h
++++ b/ps2xRuntime/include/runtime/ps2_pad.h
+@@ -4,6 +4,37 @@
+ #include <cstddef>
+ #include <cstdint>
+ 
++// Teclado/mouse -> controle do PS2 (FUNCOES.md #93). Cada botao (indice = bit da mascara do PS2: 0 Select,
++// 1 L3, 2 R3, 3 Start, 4 Cima, 5 Direita, 6 Baixo, 7 Esquerda, 8 L2, 9 R2, 10 L1, 11 R1, 12 Triangulo,
++// 13 Circulo, 14 Xis, 15 Quadrado) aceita ate kSlots entradas: tecla da raylib (KEY_*) ou um dos PS2_INPUT_*.
++// Movimento: as quatro direcoes viram o analogico esquerdo inclinado em walkTilt; segurando "run", todo inclinado.
++// O mouse (movimento = analogico direito) so conta com o cursor capturado (primeiro clique; F2 solta).
++enum : int
++{
++    PS2_INPUT_NONE = 0,
++    PS2_INPUT_MOUSE_LEFT = -1,
++    PS2_INPUT_MOUSE_RIGHT = -2,
++    PS2_INPUT_MOUSE_MIDDLE = -3,
++    PS2_INPUT_WHEEL_UP = -4,
++    PS2_INPUT_WHEEL_DOWN = -5,
++    PS2_INPUT_MOUSE_SIDE = -6,  // botao lateral de tras (Mouse 4)
++    PS2_INPUT_MOUSE_EXTRA = -7, // botao lateral da frente (Mouse 5)
++};
++
++struct Ps2PadKeyMap
++{
++    static constexpr int kSlots = 3;
++    int buttons[16][kSlots] = {};
++    int moveUp[kSlots] = {}, moveDown[kSlots] = {}, moveLeft[kSlots] = {}, moveRight[kSlots] = {};
++    int run[kSlots] = {};
++    float walkTilt = 1.0f; // 1 = sem distincao andar/correr
++};
++
++// Padrao do runtime: setas, WASD, Z/X/C/V, Q/E, Shift, Enter, Tab, R/F; mouse esq./dir. = L1/R1.
++Ps2PadKeyMap ps2PadDefaultKeyMap();
++void ps2PadSetKeyMap(const Ps2PadKeyMap &map);
++Ps2PadKeyMap ps2PadGetKeyMap();
++
+ class PSPadBackend
+ {
+ public:
 diff --git a/ps2xRuntime/include/runtime/ps2_vu1.h b/ps2xRuntime/include/runtime/ps2_vu1.h
 index 67c8184..47ec13b 100644
 --- a/ps2xRuntime/include/runtime/ps2_vu1.h
@@ -2681,17 +2748,72 @@ index 67c8184..47ec13b 100644
      uint64_t m_efuResourceReady = 0;
      uint32_t m_workingClip = 0;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index c5e31c4..f6e21b6 100644
+index c5e31c4..04c4e0a 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -1,3 +1,6 @@
+@@ -1,3 +1,8 @@
++#include <atomic>
++#include <cstdio>
 +#include <cstdlib>
 +#include <chrono>
 +#include "runtime/gs/gs_draw_stats.h"
  #include "runtime/ee_scheduler.h"
  
  #include "ps2_log.h"
-@@ -173,6 +176,27 @@ void EeScheduler::run()
+@@ -82,6 +87,52 @@ EeScheduler::~EeScheduler()
+     requestStop();
+ }
+ 
++namespace
++{
++    std::atomic<uint32_t> g_stackGuardAddr{0u};
++    std::atomic<uint32_t> g_stackGuardValue{0u};
++}
++
++void ps2SetStackGuard(uint32_t addr, uint32_t value)
++{
++    g_stackGuardValue.store(value, std::memory_order_relaxed);
++    g_stackGuardAddr.store(addr, std::memory_order_release);
++}
++
++void ps2ClearStackGuard()
++{
++    g_stackGuardAddr.store(0u, std::memory_order_release);
++}
++
++namespace
++{
++    std::atomic<uint32_t> g_spCheckLo{0u}, g_spCheckHi{0u}, g_spCheckSp{0u};
++}
++
++void ps2SetSpExpectation(uint32_t lo, uint32_t hi, uint32_t sp)
++{
++    g_spCheckSp.store(sp, std::memory_order_relaxed);
++    g_spCheckHi.store(hi, std::memory_order_relaxed);
++    g_spCheckLo.store(lo, std::memory_order_release);
++}
++
++uint32_t ps2StackGuardAddr()
++{
++    return g_stackGuardAddr.load(std::memory_order_acquire);
++}
++
++namespace
++{
++    std::atomic<int> g_diagThreadId{0};
++    std::atomic<int> g_diagInvocations{0};
++}
++
++void ps2DiagCurrentGuest(int &threadId, int &invocations)
++{
++    threadId = g_diagThreadId.load(std::memory_order_relaxed);
++    invocations = g_diagInvocations.load(std::memory_order_relaxed);
++}
++
+ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+ {
+     m_executorThread = std::this_thread::get_id();
+@@ -173,6 +224,27 @@ void EeScheduler::run()
                  copyMainContextToRuntime();
                  publishIdleDebugContext();
                  publishSnapshot();
@@ -2719,7 +2841,126 @@ index c5e31c4..f6e21b6 100644
                  waitForEvent();
                  continue;
              }
-@@ -392,6 +416,17 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+@@ -274,6 +346,28 @@ void EeScheduler::run()
+             }
+             else
+             {
++                // Ultimos despachos antes do PC invalido (de onde veio o retorno corrompido; RDR: salto para
++                // 0x510000 ao carregar fase, docs/ESTADO.md)
++                std::fprintf(stderr, "[ee-sched] PC invalido 0x%x na thread %d; ultimos despachos (pc/ra/sp):",
++                             context.pc, m_currentThreadId);
++                for (uint32_t k = 0; k < kDispatchRing; ++k)
++                {
++                    const DispatchRecord &r = m_dispatchRing[(m_dispatchRingPos + k) % kDispatchRing];
++                    std::fprintf(stderr, " t%d:%x/%x/%x", r.thread, r.pc, r.ra, r.sp);
++                }
++                std::fprintf(stderr, "\n");
++                // Memoria da pilha em volta do sp atual (quadro da funcao que retornou para o PC invalido)
++                {
++                    const uint32_t sp = getRegU32(&context, 29) & 0x1FFFFF0u;
++                    std::fprintf(stderr, "[ee-sched] pilha 0x%x..0x%x:", sp - 0x100u, sp + 0x40u);
++                    for (uint32_t a = sp - 0x100u; a < sp + 0x40u && a + 4u <= PS2_RAM_SIZE; a += 4u)
++                    {
++                        uint32_t w = 0;
++                        std::memcpy(&w, m_rdram + a, 4);
++                        std::fprintf(stderr, "%s%08x", (a & 0xFu) == 0u ? "  " : " ", w);
++                    }
++                    std::fprintf(stderr, "\n");
++                }
+                 m_runtime.reportMissingFunction(m_rdram,
+                                                 &context,
+                                                 context.pc,
+@@ -296,8 +390,89 @@ void EeScheduler::run()
+         {
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
++            // Retorno da funcao vigiada pelo despachante (ela foi retomada depois de uma troca): desarma a guarda
++            if (g_stackGuardAddr.load(std::memory_order_relaxed) != 0u &&
++                context.pc == g_stackGuardValue.load(std::memory_order_relaxed))
++                g_stackGuardAddr.store(0u, std::memory_order_release);
++            // Retomada dentro da funcao vigiada (ps2SetSpExpectation) com sp diferente do corpo dela: registra o
++            // despacho anterior (a funcao chamada que voltou com o sp errado)
++            if (const uint32_t lo = g_spCheckLo.load(std::memory_order_acquire); lo != 0u &&
++                context.pc >= lo && context.pc < g_spCheckHi.load(std::memory_order_relaxed) && running->invocations.empty())
++            {
++                const uint32_t want = g_spCheckSp.load(std::memory_order_relaxed);
++                const uint32_t have = getRegU32(&context, 29);
++                static int s_spBad = 0;
++                if (have != want && s_spBad++ < 10)
++                {
++                    std::fprintf(stderr, "[spcheck] retomada em 0x%x com sp=0x%x (esperado 0x%x, diferenca %d); despachos:",
++                                 context.pc, have, want, static_cast<int>(have - want));
++                    for (uint32_t k = 0; k < kDispatchRing; ++k)
++                    {
++                        const DispatchRecord &r = m_dispatchRing[(m_dispatchRingPos + k) % kDispatchRing];
++                        std::fprintf(stderr, " t%d:%x/%x/%x", r.thread, r.pc, r.ra, r.sp);
++                    }
++                    std::fprintf(stderr, "\n");
++                }
++            }
++            g_diagThreadId.store(m_currentThreadId, std::memory_order_relaxed);
++            g_diagInvocations.store(static_cast<int>(running->invocations.size()), std::memory_order_relaxed);
++            m_dispatchRing[m_dispatchRingPos] = {context.pc, getRegU32(&context, 31), getRegU32(&context, 29), running->invocations.empty() ? m_currentThreadId : -100 - m_currentThreadId};
++            m_dispatchRingPos = (m_dispatchRingPos + 1) % kDispatchRing;
+             function(m_rdram, &context, &m_runtime);
+             m_guestExecuting.store(false, std::memory_order_release);
++            // Guarda de pilha (ps2SetStackGuard): a palavra no endereco deve continuar com o valor enquanto a
++            // guarda estiver armada; se mudar, registra o despacho que acabou de rodar (RDR: travamento 0x510000)
++            if (const uint32_t gAddr = g_stackGuardAddr.load(std::memory_order_acquire); gAddr != 0u)
++            {
++                uint32_t v = 0;
++                std::memcpy(&v, m_rdram + (gAddr & 0x1FFFFFCu), 4);
++                const uint32_t expected = g_stackGuardValue.load(std::memory_order_relaxed);
++                if (v != expected)
++                {
++                    g_stackGuardAddr.store(0u, std::memory_order_release);
++                    const DispatchRecord &last = m_dispatchRing[(m_dispatchRingPos + kDispatchRing - 1) % kDispatchRing];
++                    std::fprintf(stderr, "[guard] 0x%x: 0x%x -> 0x%x no despacho pc=0x%x ra=0x%x sp=0x%x thread=%d invocacoes=%zu; agora pc=0x%x sp=0x%x\n",
++                                 gAddr, expected, v, last.pc, last.ra, last.sp, m_currentThreadId,
++                                 running ? running->invocations.size() : size_t(0), context.pc, getRegU32(&context, 29));
++                    std::fprintf(stderr, "[guard] despachos:");
++                    for (uint32_t k = 0; k < kDispatchRing; ++k)
++                    {
++                        const DispatchRecord &r = m_dispatchRing[(m_dispatchRingPos + k) % kDispatchRing];
++                        std::fprintf(stderr, " t%d:%x/%x/%x", r.thread, r.pc, r.ra, r.sp);
++                    }
++                    std::fprintf(stderr, "\n");
++                }
++            }
++            // PS2X_WATCH=<end>[:<valor>]: avisa quando a palavra no endereco passa a valer <valor> (diagnostico de
++            // pilha corrompida; RDR: ra de FUN_00236568 em 0x1F7FDA8 virando 0x510000)
++            {
++                static const std::pair<uint32_t, uint32_t> s_watch = [] {
++                    uint32_t addr = 0, value = 0;
++                    if (const char *w = std::getenv("PS2X_WATCH"); w && w[0])
++                    {
++                        addr = static_cast<uint32_t>(std::strtoul(w, nullptr, 16));
++                        if (const char *c = std::strchr(w, ':'))
++                            value = static_cast<uint32_t>(std::strtoul(c + 1, nullptr, 16));
++                    }
++                    return std::make_pair(addr & 0x1FFFFFCu, value);
++                }();
++                static int s_hits = 0;
++                static uint32_t s_prev = 0;
++                if (s_watch.first != 0u && s_hits < 64)
++                {
++                    uint32_t v = 0;
++                    std::memcpy(&v, m_rdram + s_watch.first, 4);
++                    const bool became = v == s_watch.second && s_prev != s_watch.second;
++                    s_prev = v;
++                    if (became)
++                    {
++                        ++s_hits;
++                        const DispatchRecord &last = m_dispatchRing[(m_dispatchRingPos + kDispatchRing - 1) % kDispatchRing];
++                        std::fprintf(stderr, "[watch] 0x%x = 0x%x depois de executar pc=0x%x (ra=0x%x sp=0x%x); agora pc=0x%x\n",
++                                     s_watch.first, v, last.pc, last.ra, last.sp, context.pc);
++                    }
++                }
++            }
+             m_insideInterrupt = false;
+         }
+         catch (const EeDispatcherTransfer &)
+@@ -392,6 +567,17 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
  {
      const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
      m_eeCycle += elapsed;
@@ -2737,7 +2978,7 @@ index c5e31c4..f6e21b6 100644
      m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
      m_runtime.advanceIopEeCycles(elapsed);
      if (m_pendingEeTimerInterrupts != 0u)
-@@ -1171,7 +1206,21 @@ uint32_t EeScheduler::invocationStackTop()
+@@ -1171,7 +1357,21 @@ uint32_t EeScheduler::invocationStackTop()
          return existing->second;
      }
      constexpr uint32_t kInvocationStackSize = 0x4000u;
@@ -2760,7 +3001,7 @@ index c5e31c4..f6e21b6 100644
      if (top == 0u)
      {
          throw std::runtime_error("EE invocation stack space exhausted");
-@@ -1252,6 +1301,52 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
+@@ -1252,6 +1452,52 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
      return KE_OK;
  }
  
@@ -2813,7 +3054,7 @@ index c5e31c4..f6e21b6 100644
  void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
  {
      assertExecutor();
-@@ -1740,9 +1835,12 @@ void EeScheduler::applyPendingPreemption()
+@@ -1740,9 +1986,12 @@ void EeScheduler::applyPendingPreemption()
      m_timeSliceExpired = false;
  }
  
@@ -2826,7 +3067,7 @@ index c5e31c4..f6e21b6 100644
      processDueDeadlines();
      const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
      m_pendingEeTimerInterrupts = 0u;
-@@ -1763,6 +1861,33 @@ void EeScheduler::processPendingEvents()
+@@ -1763,6 +2012,33 @@ void EeScheduler::processPendingEvents()
          processEvent(event);
      }
  
@@ -2860,7 +3101,7 @@ index c5e31c4..f6e21b6 100644
      {
          std::lock_guard lock(m_eventMutex);
          const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-@@ -1781,7 +1906,6 @@ void EeScheduler::processDueDeadlines()
+@@ -1781,7 +2057,6 @@ void EeScheduler::processDueDeadlines()
          std::chrono::steady_clock::time_point pacingDeadline{};
          {
              std::unique_lock lock(m_eventMutex);
@@ -2868,7 +3109,7 @@ index c5e31c4..f6e21b6 100644
              for (const ScheduledEvent &item : m_deadlines)
              {
                  if (item.deadlineCycle <= m_eeCycle &&
-@@ -1798,6 +1922,8 @@ void EeScheduler::processDueDeadlines()
+@@ -1798,6 +2073,8 @@ void EeScheduler::processDueDeadlines()
                  return;
              }
  
@@ -2877,7 +3118,7 @@ index c5e31c4..f6e21b6 100644
              if (now < pacingDeadline)
              {
                  m_eventCv.wait_until(lock, pacingDeadline, [this]()
-@@ -1901,12 +2027,14 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1901,12 +2178,14 @@ void EeScheduler::processEvent(const EeEvent &event)
              queueInvocation(std::move(invocation));
          }
          dispatchIrq(false, 2u);
@@ -2892,7 +3133,7 @@ index c5e31c4..f6e21b6 100644
          break;
      case EeEventType::Dmac:
          break;
-@@ -1919,6 +2047,14 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -1919,6 +2198,14 @@ void EeScheduler::processEvent(const EeEvent &event)
          }
          const EeAlarm alarm = it->second;
          m_alarms.erase(it);
@@ -3702,6 +3943,23 @@ index 9614016..196efaf 100644
  
          setReturnU32(ctx, ret);
      }
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..cf19cc5 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -230,7 +230,11 @@ namespace ps2_syscalls
+             param->initial_priority,
+             param->option,
+         };
+-        setReturnS32(ctx, scheduler(rdram, ctx, runtime).createThread(decoded));
++        const int created = scheduler(rdram, ctx, runtime).createThread(decoded);
++        std::fprintf(stderr, "[CreateThread] id=%d func=0x%x stack=0x%x size=0x%x prio=%d (chamador ra=0x%x sp=0x%x)\n",
++                     created, param->func, param->stack, static_cast<uint32_t>(param->stack_size),
++                     param->initial_priority, getRegU32(ctx, 31), getRegU32(ctx, 29));
++        setReturnS32(ctx, created);
+     }
+ 
+     void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 diff --git a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp b/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
 index f0ad507..3f2cc4b 100644
 --- a/ps2xRuntime/src/lib/gs/gs_cpu_backend.cpp
@@ -4193,10 +4451,10 @@ index 5658928..7ce3149 100644
      std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
 diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp
 new file mode 100644
-index 0000000..0bb20cb
+index 0000000..cfaec33
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,503 @@
 +#include "gs_parallel_bridge.h"
 +
 +#include <cstdio>
@@ -4280,6 +4538,12 @@ index 0000000..0bb20cb
 +        ParallelGS::GSInterface iface;
 +        PrivSignals signals;
 +        std::mutex mutex;
++        // Leitura do quadro em buffer duplo (present): copia o quadro atual e le o anterior, ja pronto
++        Vulkan::BufferHandle readback[2];
++        Vulkan::Fence readbackFence[2];
++        uint32_t readbackW[2] = {}, readbackH[2] = {};
++        bool readbackPending[2] = {};
++        int readbackIndex = 0;
 +    };
 +
 +    Bridge *g_bridge = nullptr;
@@ -4402,6 +4666,9 @@ index 0000000..0bb20cb
 +            default: break;
 +            }
 +        }
++        // Texturas tambem supersampled (mais detalhe com SSAA); PS2X_GS_SS_TEXTURES=0 desliga
++        options.super_sampled_textures = options.super_sampling != ParallelGS::SuperSampling::X1 &&
++                                         !(std::getenv("PS2X_GS_SS_TEXTURES") && std::getenv("PS2X_GS_SS_TEXTURES")[0] == '0');
 +        if (!bridge->iface.init(&bridge->device, options))
 +        {
 +            std::fprintf(stderr, "[gs-parallel] GSInterface::init falhou; usando o GS de software\n");
@@ -4615,34 +4882,59 @@ index 0000000..0bb20cb
 +                         (unsigned long long)regs.pmode, (unsigned long long)regs.smode2, (unsigned long long)regs.dispfb1,
 +                         (unsigned long long)regs.display1, (unsigned long long)regs.dispfb2, (unsigned long long)regs.display2,
 +                         result.image ? result.image->get_width() : 0u, result.image ? result.image->get_height() : 0u);
-+        if (result.image)
-+        {
-+            const uint32_t w = result.image->get_width();
-+            const uint32_t h = result.image->get_height();
-+            Vulkan::BufferCreateInfo bufinfo = {};
-+            bufinfo.size = static_cast<VkDeviceSize>(w) * h * 4u;
-+            bufinfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-+            bufinfo.domain = Vulkan::BufferDomain::CachedHost;
-+            Vulkan::BufferHandle readback = device.create_buffer(bufinfo);
-+
-+            auto cmd = device.request_command_buffer();
-+            cmd->copy_image_to_buffer(*readback, *result.image, 0, {}, {w, h, 1}, 0, 0,
-+                                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
-+            cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-+                         VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
-+            Vulkan::Fence fence;
-+            device.submit(cmd, &fence);
-+            fence->wait();
-+
-+            const auto *pixels = static_cast<const uint8_t *>(device.map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT));
-+            outPixels.resize(static_cast<size_t>(bufinfo.size));
-+            std::memcpy(outPixels.data(), pixels, outPixels.size());
-+            for (size_t i = 3; i < outPixels.size(); i += 4)
-+                outPixels[i] = 0xFF;
-+            device.unmap_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT);
++        // Le os pixels de um buffer de leitura ja concluido (alfa em 0xFF: a janela desenha com mistura)
++        auto takePixels = [&](int i) {
++            g_bridge->readbackFence[i]->wait();
++            g_bridge->readbackFence[i].reset();
++            g_bridge->readbackPending[i] = false;
++            const uint32_t w = g_bridge->readbackW[i], h = g_bridge->readbackH[i];
++            const size_t bytes = static_cast<size_t>(w) * h * 4u;
++            const auto *pixels = static_cast<const uint32_t *>(device.map_host_buffer(*g_bridge->readback[i], Vulkan::MEMORY_ACCESS_READ_BIT));
++            outPixels.resize(bytes);
++            auto *dst = reinterpret_cast<uint32_t *>(outPixels.data());
++            for (size_t k = 0, n = bytes / 4u; k < n; ++k)
++                dst[k] = pixels[k] | 0xFF000000u;
++            device.unmap_host_buffer(*g_bridge->readback[i], Vulkan::MEMORY_ACCESS_READ_BIT);
 +            outWidth = w;
 +            outHeight = h;
 +            ok = true;
++        };
++        // Antes: copia + fence->wait() a cada vsync, que esvaziava a GPU e deixava CPU e GPU se alternando (com
++        // SSAA 16 a GPU ficava em 30-45%). Agora o quadro N e copiado e o N-1 lido (1 quadro de latencia).
++        // PS2X_GS_READBACK_SYNC=1 volta a esperar o quadro atual.
++        static const bool s_syncReadback = std::getenv("PS2X_GS_READBACK_SYNC") && std::getenv("PS2X_GS_READBACK_SYNC")[0] == '1';
++        if (result.image)
++        {
++            const int i = g_bridge->readbackIndex;
++            const uint32_t w = result.image->get_width();
++            const uint32_t h = result.image->get_height();
++            const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4u;
++            if (g_bridge->readbackPending[i])
++                takePixels(i); // nao deveria acontecer (o anterior e lido abaixo); garante o buffer livre
++            if (!g_bridge->readback[i] || g_bridge->readback[i]->get_create_info().size < size)
++            {
++                Vulkan::BufferCreateInfo bufinfo = {};
++                bufinfo.size = size;
++                bufinfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++                bufinfo.domain = Vulkan::BufferDomain::CachedHost;
++                g_bridge->readback[i] = device.create_buffer(bufinfo);
++            }
++            auto cmd = device.request_command_buffer();
++            cmd->copy_image_to_buffer(*g_bridge->readback[i], *result.image, 0, {}, {w, h, 1}, 0, 0,
++                                      {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
++            cmd->barrier(VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                         VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT);
++            device.submit(cmd, &g_bridge->readbackFence[i]);
++            g_bridge->readbackW[i] = w;
++            g_bridge->readbackH[i] = h;
++            g_bridge->readbackPending[i] = true;
++            g_bridge->readbackIndex = i ^ 1;
++            if (s_syncReadback)
++                takePixels(i);
++            else if (g_bridge->readbackPending[i ^ 1])
++                takePixels(i ^ 1);
++            else
++                takePixels(i); // primeiro quadro
 +        }
 +        device.next_frame_context();
 +        return ok;
@@ -6083,10 +6375,10 @@ index 37b6a4d..e4bd0df 100644
 +    }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..5ee98cc 100644
+index 8590f14..0a4e7ca 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
-@@ -1,6 +1,13 @@
+@@ -1,6 +1,14 @@
  #include "runtime/ps2_pad.h"
  #include "ps2_host_backend.h"
 +#include <algorithm>
@@ -6096,46 +6388,25 @@ index 8590f14..5ee98cc 100644
 +#include <cstdlib>
  #include <cstring>
 +#include <mutex>
++#include <initializer_list>
 +#include <string>
  
  namespace
  {
-@@ -23,6 +30,123 @@ namespace
+@@ -23,6 +31,179 @@ namespace
      constexpr uint16_t PAD_L1 = 0x0400u;
      constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
 +
-+    // Mouse (FUNCOES.md #53): o movimento vira o analogico direito e os botoes/rodinha viram botoes do
-+    // controle. A janela captura o cursor no primeiro clique; F2 (ou perder o foco) solta.
-+    // PS2X_MOUSE=0 desliga; PS2X_MOUSE_SENS (padrao 6, unidades do analogico por pixel);
-+    // PS2X_MOUSE_LEFT/RIGHT/MIDDLE/WHEEL = L1 R1 L2 R2 L3 R3 CROSS CIRCLE SQUARE TRIANGLE START SELECT NONE;
-+    // PS2X_MOUSE_INVERT_Y=1 inverte o eixo vertical.
-+    uint16_t parseButton(const char *env, uint16_t fallback)
-+    {
-+        const char *v = std::getenv(env);
-+        if (!v || !*v)
-+            return fallback;
-+        std::string n(v);
-+        std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-+        const struct { const char *name; uint16_t mask; } table[] = {
-+            {"L1", PAD_L1}, {"R1", PAD_R1}, {"L2", PAD_L2}, {"R2", PAD_R2}, {"L3", PAD_L3}, {"R3", PAD_R3},
-+            {"CROSS", PAD_CROSS}, {"X", PAD_CROSS}, {"CIRCLE", PAD_CIRCLE}, {"SQUARE", PAD_SQUARE},
-+            {"TRIANGLE", PAD_TRIANGLE}, {"START", PAD_START}, {"SELECT", PAD_SELECT}, {"NONE", 0u}};
-+        for (const auto &e : table)
-+            if (n == e.name)
-+                return e.mask;
-+        return fallback;
-+    }
-+
++    // Mouse (FUNCOES.md #53): o movimento vira o analogico direito; os botoes e a roda entram no mapa de teclas
++    // (Ps2PadKeyMap). A janela captura o cursor no primeiro clique; F2 (ou perder o foco) solta.
++    // PS2X_MOUSE=0 desliga; PS2X_MOUSE_SENS (padrao 6, unidades do analogico por pixel); PS2X_MOUSE_INVERT_Y=1.
 +    struct MouseConfig
 +    {
 +        bool enabled = true;
 +        float sens = 6.0f;
 +        bool invertY = false;
-+        uint16_t left = PAD_R1;   // atirar (hipotese: confirmar no tutorial do jogo)
-+        uint16_t right = PAD_L1;  // mirar / travar alvo (hipotese)
-+        uint16_t middle = PAD_R3;
-+        uint16_t wheel = PAD_R3;  // zoom (hipotese)
++
 +        MouseConfig()
 +        {
 +            if (const char *v = std::getenv("PS2X_MOUSE"))
@@ -6144,10 +6415,6 @@ index 8590f14..5ee98cc 100644
 +                sens = static_cast<float>(std::atof(v));
 +            if (const char *v = std::getenv("PS2X_MOUSE_INVERT_Y"))
 +                invertY = std::atoi(v) != 0;
-+            left = parseButton("PS2X_MOUSE_LEFT", left);
-+            right = parseButton("PS2X_MOUSE_RIGHT", right);
-+            middle = parseButton("PS2X_MOUSE_MIDDLE", middle);
-+            wheel = parseButton("PS2X_MOUSE_WHEEL", wheel);
 +        }
 +    };
 +
@@ -6164,9 +6431,81 @@ index 8590f14..5ee98cc 100644
 +        bool captured = false;
 +        float dx = 0.0f;
 +        float dy = 0.0f;
-+        uint16_t buttons = 0u; // mascara de botoes do controle pressionados pelo mouse
-+        std::chrono::steady_clock::time_point wheelUntil{};
++        uint8_t down = 0u; // bit n = entrada PS2_INPUT_* de valor -(n+1) pressionada
++        std::chrono::steady_clock::time_point wheelUpUntil{}, wheelDownUntil{};
 +    } g_mouse;
++
++    std::mutex g_keyMapMutex;
++
++    bool inputDown(int input, uint8_t mouseDown)
++    {
++        if (input > 0)
++            return IsKeyDown(input);
++        if (input < 0 && input >= -8)
++            return ((mouseDown >> (-input - 1)) & 1u) != 0u;
++        return false;
++    }
++
++    bool anyDown(const int (&inputs)[Ps2PadKeyMap::kSlots], uint8_t mouseDown)
++    {
++        for (int input : inputs)
++            if (inputDown(input, mouseDown))
++                return true;
++        return false;
++    }
++
++    Ps2PadKeyMap &keyMap()
++    {
++        static Ps2PadKeyMap map = ps2PadDefaultKeyMap();
++        return map;
++    }
++}
++
++Ps2PadKeyMap ps2PadDefaultKeyMap()
++{
++    Ps2PadKeyMap m;
++    auto set = [&m](uint16_t mask, std::initializer_list<int> inputs) {
++        int bit = 0;
++        while (bit < 16 && (mask >> bit) != 1u)
++            ++bit;
++        int k = 0;
++        for (int in : inputs)
++            if (k < Ps2PadKeyMap::kSlots)
++                m.buttons[bit][k++] = in;
++    };
++    set(PAD_UP, {KEY_UP});
++    set(PAD_DOWN, {KEY_DOWN});
++    set(PAD_LEFT, {KEY_LEFT});
++    set(PAD_RIGHT, {KEY_RIGHT});
++    set(PAD_CROSS, {KEY_X, KEY_SPACE});
++    set(PAD_CIRCLE, {KEY_C, KEY_ESCAPE});
++    set(PAD_SQUARE, {KEY_Z, KEY_KP_0});
++    set(PAD_TRIANGLE, {KEY_V, KEY_KP_1});
++    set(PAD_L1, {KEY_Q, PS2_INPUT_MOUSE_LEFT});
++    set(PAD_R1, {KEY_E, PS2_INPUT_MOUSE_RIGHT});
++    set(PAD_L2, {KEY_LEFT_SHIFT});
++    set(PAD_R2, {KEY_RIGHT_SHIFT});
++    set(PAD_START, {KEY_ENTER});
++    set(PAD_SELECT, {KEY_TAB});
++    set(PAD_R3, {KEY_R});
++    set(PAD_L3, {KEY_F});
++    m.moveUp[0] = KEY_W;
++    m.moveDown[0] = KEY_S;
++    m.moveLeft[0] = KEY_A;
++    m.moveRight[0] = KEY_D;
++    return m;
++}
++
++void ps2PadSetKeyMap(const Ps2PadKeyMap &map)
++{
++    std::lock_guard<std::mutex> lock(g_keyMapMutex);
++    keyMap() = map;
++}
++
++Ps2PadKeyMap ps2PadGetKeyMap()
++{
++    std::lock_guard<std::mutex> lock(g_keyMapMutex);
++    return keyMap();
 +}
 +
 +// Menu do port aberto (ps2_runtime.cpp, FUNCOES.md #66): o jogo ve o controle em repouso e o mouse e solto.
@@ -6202,29 +6541,39 @@ index 8590f14..5ee98cc 100644
 +    if (!captured)
 +    {
 +        g_mouse.dx = g_mouse.dy = 0.0f;
-+        g_mouse.buttons = 0u;
++        g_mouse.down = 0u;
 +        return;
 +    }
 +    const Vector2 d = GetMouseDelta();
 +    g_mouse.dx += d.x;
 +    g_mouse.dy += cfg.invertY ? -d.y : d.y;
-+    uint16_t b = 0u;
++    uint8_t b = 0u;
 +    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-+        b |= cfg.left;
++        b |= 1u << 0;
 +    if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
-+        b |= cfg.right;
++        b |= 1u << 1;
 +    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
-+        b |= cfg.middle;
++        b |= 1u << 2;
++    if (IsMouseButtonDown(MOUSE_BUTTON_SIDE))
++        b |= 1u << 5;
++    if (IsMouseButtonDown(MOUSE_BUTTON_EXTRA))
++        b |= 1u << 6;
++    // o jogo le o controle a poucos qps: a roda segura o botao por 200 ms
 +    const auto now = std::chrono::steady_clock::now();
-+    if (GetMouseWheelMove() != 0.0f)
-+        g_mouse.wheelUntil = now + std::chrono::milliseconds(200); // o jogo le o controle a poucos qps: segura o botao
-+    if (now < g_mouse.wheelUntil)
-+        b |= cfg.wheel;
-+    g_mouse.buttons = b;
++    const float wheel = GetMouseWheelMove();
++    if (wheel > 0.0f)
++        g_mouse.wheelUpUntil = now + std::chrono::milliseconds(200);
++    if (wheel < 0.0f)
++        g_mouse.wheelDownUntil = now + std::chrono::milliseconds(200);
++    if (now < g_mouse.wheelUpUntil)
++        b |= 1u << 3;
++    if (now < g_mouse.wheelDownUntil)
++        b |= 1u << 4;
++    g_mouse.down = b;
  }
  
  bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
-@@ -36,6 +160,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -36,6 +217,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[2] = 0xFF;
      data[3] = 0xFF;
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
@@ -6233,46 +6582,63 @@ index 8590f14..5ee98cc 100644
  
      uint16_t btns = 0xFFFFu;
      constexpr int kGamepad = 0;
-@@ -89,14 +215,26 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -87,36 +270,45 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+         data[4] = static_cast<uint8_t>(128 + rx * 127);
+         data[5] = static_cast<uint8_t>(128 + ry * 127);
      }
-     else
+-    else
++
++    // Teclado e mouse pelo mapa (valem junto com o controle)
      {
 -        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-+        // Setas = direcional; WASD = analogico esquerdo (o jogo anda pelo analogico) (FUNCOES.md #53)
-+        if (IsKeyDown(KEY_UP))
-             clearBit(PAD_UP);
+-            clearBit(PAD_UP);
 -        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-+        if (IsKeyDown(KEY_DOWN))
-             clearBit(PAD_DOWN);
+-            clearBit(PAD_DOWN);
 -        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-+        if (IsKeyDown(KEY_LEFT))
-             clearBit(PAD_LEFT);
+-            clearBit(PAD_LEFT);
 -        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-+        if (IsKeyDown(KEY_RIGHT))
-             clearBit(PAD_RIGHT);
-+        int lx = 0, ly = 0;
-+        if (IsKeyDown(KEY_A))
-+            lx -= 127;
-+        if (IsKeyDown(KEY_D))
-+            lx += 127;
-+        if (IsKeyDown(KEY_W))
-+            ly -= 127;
-+        if (IsKeyDown(KEY_S))
-+            ly += 127;
-+        data[6] = static_cast<uint8_t>(128 + lx);
-+        data[7] = static_cast<uint8_t>(128 + ly);
-         if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-             clearBit(PAD_CROSS);
-         if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-@@ -117,6 +255,27 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
-             clearBit(PAD_START);
-         if (IsKeyDown(KEY_TAB))
-             clearBit(PAD_SELECT);
-+        // Cliques dos analogicos (zoom/Dead Eye usam R3/L3 em varios jogos)
-+        if (IsKeyDown(KEY_R))
-+            clearBit(PAD_R3);
-+        if (IsKeyDown(KEY_F))
-+            clearBit(PAD_L3);
+-            clearBit(PAD_RIGHT);
+-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
+-            clearBit(PAD_CROSS);
+-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
+-            clearBit(PAD_CIRCLE);
+-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
+-            clearBit(PAD_SQUARE);
+-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
+-            clearBit(PAD_TRIANGLE);
+-        if (IsKeyDown(KEY_Q))
+-            clearBit(PAD_L1);
+-        if (IsKeyDown(KEY_E))
+-            clearBit(PAD_R1);
+-        if (IsKeyDown(KEY_LEFT_SHIFT))
+-            clearBit(PAD_L2);
+-        if (IsKeyDown(KEY_RIGHT_SHIFT))
+-            clearBit(PAD_R2);
+-        if (IsKeyDown(KEY_ENTER))
+-            clearBit(PAD_START);
+-        if (IsKeyDown(KEY_TAB))
+-            clearBit(PAD_SELECT);
++        const Ps2PadKeyMap map = ps2PadGetKeyMap();
++        uint8_t mouseDown = 0u;
++        {
++            std::lock_guard<std::mutex> lock(g_mouse.mutex);
++            if (g_mouse.captured)
++                mouseDown = g_mouse.down;
++        }
++        for (int bit = 0; bit < 16; ++bit)
++            if (anyDown(map.buttons[bit], mouseDown))
++                clearBit(static_cast<uint16_t>(1u << bit));
++        int dx = 0, dy = 0;
++        dx -= anyDown(map.moveLeft, mouseDown) ? 1 : 0;
++        dx += anyDown(map.moveRight, mouseDown) ? 1 : 0;
++        dy -= anyDown(map.moveUp, mouseDown) ? 1 : 0;
++        dy += anyDown(map.moveDown, mouseDown) ? 1 : 0;
++        if (dx != 0 || dy != 0)
++        {
++            const float tilt = anyDown(map.run, mouseDown) ? 1.0f : std::clamp(map.walkTilt, 0.0f, 1.0f);
++            data[6] = static_cast<uint8_t>(128 + static_cast<int>(dx * tilt * 127.0f));
++            data[7] = static_cast<uint8_t>(128 + static_cast<int>(dy * tilt * 127.0f));
++        }
 +    }
 +
 +    {
@@ -6287,13 +6653,12 @@ index 8590f14..5ee98cc 100644
 +            data[4] = addAxis(data[4], g_mouse.dx);
 +            data[5] = addAxis(data[5], g_mouse.dy);
 +            g_mouse.dx = g_mouse.dy = 0.0f;
-+            btns &= static_cast<uint16_t>(~g_mouse.buttons);
 +        }
      }
  
      data[2] = static_cast<uint8_t>(btns & 0xFF);
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..23a77ff 100644
+index 45cb9d2..1ded370 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,5 @@
@@ -6328,7 +6693,7 @@ index 45cb9d2..23a77ff 100644
  #include <unordered_map>
  #include <sstream>
  
-@@ -37,6 +46,346 @@ namespace ps2_stubs
+@@ -37,6 +46,359 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -6474,16 +6839,27 @@ index 45cb9d2..23a77ff 100644
 +
 +    constexpr int kPadIndex = 0;
 +
++    // Teclas do mapa (Ps2PadKeyMap, FUNCOES.md #93) de um botao do PS2: bit 12 triangulo, 13 circulo, 14 xis
++    bool mappedKey(int bit, bool held)
++    {
++        const Ps2PadKeyMap map = ps2PadGetKeyMap();
++        for (int in : map.buttons[bit])
++            if (in > 0 && (held ? IsKeyDown(in) : IsKeyPressed(in)))
++                return true;
++        return false;
++    }
++
 +    bool backButtonPressed()
 +    {
-+        return IsKeyPressed(KEY_V) || IsKeyPressed(KEY_KP_1) ||
++        return IsKeyPressed(KEY_V) || IsKeyPressed(KEY_KP_1) || mappedKey(12, false) ||
 +               (IsGamepadAvailable(kPadIndex) && IsGamepadButtonPressed(kPadIndex, GAMEPAD_BUTTON_RIGHT_FACE_UP));
 +    }
 +
 +    bool dialogKeysHeld()
 +    {
 +        if (IsKeyDown(KEY_ENTER) || IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_ESCAPE) || IsKeyDown(KEY_X) ||
-+            IsKeyDown(KEY_C) || IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1) || IsMouseButtonDown(MOUSE_BUTTON_LEFT))
++            IsKeyDown(KEY_C) || IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1) || IsMouseButtonDown(MOUSE_BUTTON_LEFT) ||
++            mappedKey(12, true) || mappedKey(13, true) || mappedKey(14, true))
 +            return true;
 +        if (!IsGamepadAvailable(kPadIndex))
 +            return false;
@@ -6529,6 +6905,7 @@ index 45cb9d2..23a77ff 100644
 +            if (IsKeyPressed(KEY_ENTER)) reason = "Enter";
 +            else if (IsKeyPressed(KEY_SPACE)) reason = "Espaco";
 +            else if (IsKeyPressed(KEY_X)) reason = "X";
++            else if (mappedKey(14, false)) reason = "tecla do xis";
 +            else if (padPressed(GAMEPAD_BUTTON_RIGHT_FACE_DOWN)) reason = "controle (confirmar)";
 +        }
 +        bool confirm = reason != nullptr;
@@ -6537,6 +6914,7 @@ index 45cb9d2..23a77ff 100644
 +        {
 +            if (IsKeyPressed(KEY_ESCAPE)) reason = "Esc";
 +            else if (IsKeyPressed(KEY_C)) reason = "C";
++            else if (mappedKey(13, false)) reason = "tecla do circulo";
 +            else if (backButtonPressed()) reason = "voltar";
 +            else if (padPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)) reason = "controle (cancelar)";
 +            cancel = reason != nullptr;
@@ -6675,7 +7053,7 @@ index 45cb9d2..23a77ff 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -92,6 +441,26 @@ namespace
+@@ -92,6 +454,26 @@ namespace
      constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
      constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
  
@@ -6702,7 +7080,7 @@ index 45cb9d2..23a77ff 100644
      constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
      constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
      constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
-@@ -373,6 +742,19 @@ namespace
+@@ -373,6 +755,19 @@ namespace
      }
  }
  
@@ -6722,7 +7100,7 @@ index 45cb9d2..23a77ff 100644
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -388,13 +770,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -388,13 +783,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
  
      const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
      const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -6740,7 +7118,7 @@ index 45cb9d2..23a77ff 100644
      {
          outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
          outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-@@ -407,7 +791,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -407,7 +804,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      uint32_t displayFbp = 0u;
      uint32_t sourceFbp = 0u;
      bool usedPreferredDisplaySource = false;
@@ -6755,7 +7133,7 @@ index 45cb9d2..23a77ff 100644
                                                     width,
                                                     height,
                                                     &displayFbp,
-@@ -450,6 +840,33 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -450,6 +853,33 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_lastWidth = width;
      s_lastHeight = height;
  
@@ -6789,7 +7167,7 @@ index 45cb9d2..23a77ff 100644
      std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
      if (!s_scratch.empty() && width != 0u && height != 0u)
      {
-@@ -505,6 +922,13 @@ PS2Runtime::PS2Runtime()
+@@ -505,6 +935,13 @@ PS2Runtime::PS2Runtime()
      m_guestHeapConfigured = false;
      m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
      m_asyncCallbackStackTop = PS2_RAM_SIZE;
@@ -6803,7 +7181,7 @@ index 45cb9d2..23a77ff 100644
  }
  
  void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
-@@ -564,36 +988,134 @@ PS2Runtime::~PS2Runtime()
+@@ -564,36 +1001,134 @@ PS2Runtime::~PS2Runtime()
      }
  }
  
@@ -6938,7 +7316,7 @@ index 45cb9d2..23a77ff 100644
      auto scope = m_iopHost->enterCall(ctx, rdram);
      request.callToken = scope.token();
      return m_iopSubsystem->handleRpc(request);
-@@ -601,52 +1123,120 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
+@@ -601,52 +1136,120 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
  
  void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
  {
@@ -7060,7 +7438,7 @@ index 45cb9d2..23a77ff 100644
      return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
  }
  
-@@ -665,6 +1255,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -665,6 +1268,8 @@ bool PS2Runtime::syncCoreSubsystems()
      }
  
      m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
@@ -7069,7 +7447,7 @@ index 45cb9d2..23a77ff 100644
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
-@@ -732,11 +1324,43 @@ bool PS2Runtime::initialize(const char *title)
+@@ -732,11 +1337,43 @@ bool PS2Runtime::initialize(const char *title)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
          SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -7114,7 +7492,7 @@ index 45cb9d2..23a77ff 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -974,6 +1598,20 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+@@ -974,6 +1611,20 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
          const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
          m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
          m_asyncCallbackStackTop = PS2_RAM_SIZE;
@@ -7135,7 +7513,7 @@ index 45cb9d2..23a77ff 100644
      }
  
      LoadedModule module;
-@@ -1677,6 +2315,11 @@ void PS2Runtime::ensureGuestHeapInitializedLocked()
+@@ -1677,6 +2328,11 @@ void PS2Runtime::ensureGuestHeapInitializedLocked()
          return;
      }
  
@@ -7147,7 +7525,7 @@ index 45cb9d2..23a77ff 100644
      const uint32_t suggested = (m_guestHeapSuggestedBase == 0u) ? kGuestHeapDefaultBase : m_guestHeapSuggestedBase;
      resetGuestHeapLocked(suggested, clampGuestHeapLimit(0u));
  }
-@@ -1804,9 +2447,21 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
+@@ -1804,9 +2460,21 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
      coalesceGuestHeapLocked();
  }
  
@@ -7169,7 +7547,7 @@ index 45cb9d2..23a77ff 100644
      uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
      if (normalizedBase == 0u)
      {
-@@ -2388,6 +3043,63 @@ void PS2Runtime::run()
+@@ -2388,6 +3056,63 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -7233,7 +7611,7 @@ index 45cb9d2..23a77ff 100644
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
              if ((tick % 120) == 0)
-@@ -2410,6 +3122,9 @@ void PS2Runtime::run()
+@@ -2410,6 +3135,9 @@ void PS2Runtime::run()
                                                 << " gp=0x" << dbgGp
                                                 << " dispfb1=0x" << gs.dispfb1
                                                 << " display1=0x" << gs.display1
@@ -7243,7 +7621,7 @@ index 45cb9d2..23a77ff 100644
                                                 << std::dec
                                                 << " activeThreads=" << eeSnapshot.threads.size()
                                                 << " dma=" << curDma
-@@ -2417,6 +3132,49 @@ void PS2Runtime::run()
+@@ -2417,6 +3145,49 @@ void PS2Runtime::run()
                                                 << " gsw=" << curGs
                                                 << " vif=" << curVif
                                                 << std::endl);
@@ -7293,7 +7671,7 @@ index 45cb9d2..23a77ff 100644
  
              }
          });
-@@ -2424,15 +3182,57 @@ void PS2Runtime::run()
+@@ -2424,15 +3195,57 @@ void PS2Runtime::run()
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
  
@@ -7354,7 +7732,7 @@ index 45cb9d2..23a77ff 100644
          const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
          const Rectangle dstRect{
              (screenWidth - dstWidth) * 0.5f,
-@@ -2444,8 +3244,19 @@ void PS2Runtime::run()
+@@ -2444,8 +3257,19 @@ void PS2Runtime::run()
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
          }
@@ -7374,7 +7752,7 @@ index 45cb9d2..23a77ff 100644
          if (WindowShouldClose())
          {
              RUNTIME_LOG("[run] window close requested, breaking out of loop");
-@@ -2459,6 +3270,7 @@ void PS2Runtime::run()
+@@ -2459,6 +3283,7 @@ void PS2Runtime::run()
      {
          gameThread.join();
      }

@@ -59,3 +59,5 @@ filtros `next dec` / `next unchanged` partindo de uma busca ampla (`--type f32` 
 Não há `.pnach` público para este CRC (`E169BAF8` no PCSX2). Existem códigos CodeBreaker (formato CB7,
 criptografado) para o SLUS-20500 em PSX Data Center e almarsguides; podem ser decodificados para obter
 endereços crus, que então precisam ser confirmados aqui.
+
+| `0x006AAB84` | f32 x3 (x, y, z) | Posição do Red no tutorial (perfnew); muda só quando ele anda. Achado por comparação de RAM (`tools/find_pos.py`, 2026-11-01). **Hipótese** para as outras fases: o endereço pode mudar com a fase. |

@@ -29,6 +29,8 @@
 bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4]); // rdr_quit_dialog.cpp
 void rdrControlsLoad();                                                         // rdr_controls.cpp
 void rdrKeyIconsInstall(PS2Runtime &runtime);                                  // rdr_keyicons.cpp
+void rdrSettingsInstall();                                                      // rdr_settings.cpp
+void rdrSettingsSetMainMenu(bool mainMenu);                                     // rdr_settings.cpp
 std::filesystem::path rdrDocumentsDirectory();                                 // rdr_win32.cpp
 
 namespace
@@ -931,6 +933,7 @@ namespace
             std::fprintf(stderr, "[rdr] prompts %s\n", mode.c_str());
         }
         ps2SetBackExitEnabled(mode == "book" || mode == "poster" || mode == "journal");
+        rdrSettingsSetMainMenu(mode == "book" || mode == "poster" || mode == "journal");
         g_origPromptMode(rdram, ctx, runtime);
     }
 
@@ -978,6 +981,7 @@ namespace
         ps2SetQuitDialogDrawer(rdrDrawQuitDialog);
         rdrControlsLoad();
         rdrKeyIconsInstall(runtime);
+        rdrSettingsInstall();
         loadExtraArgs();
         if (std::getenv("RDR_TRACE_PARAMS"))
         {

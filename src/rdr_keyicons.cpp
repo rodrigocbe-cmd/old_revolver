@@ -451,3 +451,9 @@ void rdrKeyIconsInvalidate()
     for (auto &[k, p] : g_pages)
         p.built = false, p.patched.clear();
 }
+
+// Rotulo curto de uma tecla (como nos icones): SPC, BKS, LMB...
+std::string rdrKeyShortLabel(int code)
+{
+    return keyLabel(code);
+}

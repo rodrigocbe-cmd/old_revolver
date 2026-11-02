@@ -298,3 +298,29 @@ bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4])
     }
     return true;
 }
+
+// Texto com as fontes do jogo para outros menus do port (rdr_settings.cpp). font 0 = regulatorcondensed (titulos e
+// opcoes grandes), 1 = berrylium (texto). y = linha de base.
+bool rdrUiReady()
+{
+    return loadAssets();
+}
+
+float rdrUiScaleFor(int font, char ref, float pixelHeight)
+{
+    const auto &f = font == 0 ? g_assets.title : g_assets.prompt;
+    const auto *g = f.find(static_cast<uint8_t>(ref));
+    return g && g->h > 0 ? pixelHeight / g->h : 1.0f;
+}
+
+float rdrUiTextWidth(int font, const std::string &text, float scale)
+{
+    const auto &f = font == 0 ? g_assets.title : g_assets.prompt;
+    return f.width(chars(text.c_str()), scale);
+}
+
+void rdrUiDrawText(int font, const std::string &text, float x, float baseline, float scale, Color color)
+{
+    const auto &f = font == 0 ? g_assets.title : g_assets.prompt;
+    f.draw(chars(text.c_str()), x, baseline, scale, color);
+}

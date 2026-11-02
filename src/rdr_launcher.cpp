@@ -35,6 +35,7 @@ bool rdrCreateShortcut(const fs::path &lnk, const fs::path &target, const std::w
 bool rdrConfirm(const std::wstring &text, const std::wstring &title);
 bool rdrScheduleRemoval(const fs::path &root, const std::vector<std::wstring> &items);
 bool rdrSteamRunning();
+void rdrSettingsApplyAtBoot();
 std::string rdrSteamShortcut(const fs::path &root, bool add);
 bool rdrSteamAddWhenClosed(const fs::path &exe);
 void rdrSteamWaitForExit();
@@ -347,6 +348,7 @@ namespace
         // do lancador vazando para a janela do jogo, FUNCOES.md #89).
         int sw = 1920, sh = 1080;
         rdrNativeScreenSize(sw, sh);
+        rdrSettingsApplyAtBoot(); // settings.ini (menu de opcoes, F1) antes dos padroes abaixo
         rdrSetEnvDefault("PS2X_DIST", "1");
         rdrSetEnvDefault("PS2X_FULLSCREEN", "1");
         rdrSetEnvDefault("PS2X_WINDOW_SIZE", std::to_string(sw) + "x" + std::to_string(sh));

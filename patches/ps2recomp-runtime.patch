@@ -2240,7 +2240,7 @@ index 589d768..04812ea 100644
  
  # Vita: Work around for GCC 10's LTO plugin
 diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
-index 4b9242c..08e0c02 100644
+index 4b9242c..21b97da 100644
 --- a/ps2xRuntime/include/ps2_runtime.h
 +++ b/ps2xRuntime/include/ps2_runtime.h
 @@ -237,6 +237,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
@@ -2289,7 +2289,7 @@ index 4b9242c..08e0c02 100644
  }
  
  class PS2Runtime
-@@ -551,4 +552,34 @@ extern const uint32_t g_ps2RecompiledFunctionTableEnd;
+@@ -551,4 +552,40 @@ extern const uint32_t g_ps2RecompiledFunctionTableEnd;
  extern const uint32_t g_ps2RecompiledFunctionTableSlotCount;
  extern PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[];
  
@@ -2303,6 +2303,12 @@ index 4b9242c..08e0c02 100644
 +// Retorna false se nao conseguiu desenhar (o runtime usa a caixa simples).
 +using Ps2QuitDialogDrawer = bool (*)(const float game[4], int selected, float items[2][4]);
 +void ps2SetQuitDialogDrawer(Ps2QuitDialogDrawer drawer);
++// Overlay do jogo (menu de opcoes do port): chamado a cada quadro depois da imagem do jogo, com a area dela na janela.
++// Retorna true enquanto estiver aberto: o controle fica bloqueado para o jogo e a caixa de saida nao abre.
++using Ps2OverlayHandler = bool (*)(const float game[4]);
++void ps2SetOverlayHandler(Ps2OverlayHandler handler);
++// Filtro da imagem do jogo na janela: false = suave (bilinear), true = nitido (ponto)
++void ps2SetFrameFilterSharp(bool sharp);
 +
 +// Versao de distribuicao (PS2X_DIST=1): sem painel/menus de debug (F1, F9, F11).
 +bool ps2DistMode();
@@ -2676,10 +2682,10 @@ index 0000000..98ecb0d
 +
 +#endif // PS2_MPEG_OPTIONS_H
 diff --git a/ps2xRuntime/include/runtime/ps2_pad.h b/ps2xRuntime/include/runtime/ps2_pad.h
-index 7755fe6..569c0ba 100644
+index 7755fe6..7b60e35 100644
 --- a/ps2xRuntime/include/runtime/ps2_pad.h
 +++ b/ps2xRuntime/include/runtime/ps2_pad.h
-@@ -4,6 +4,37 @@
+@@ -4,6 +4,44 @@
  #include <cstddef>
  #include <cstdint>
  
@@ -2713,6 +2719,13 @@ index 7755fe6..569c0ba 100644
 +Ps2PadKeyMap ps2PadDefaultKeyMap();
 +void ps2PadSetKeyMap(const Ps2PadKeyMap &map);
 +Ps2PadKeyMap ps2PadGetKeyMap();
++// Mouse: unidades do analogico direito por pixel (padrao 6, PS2X_MOUSE_SENS) e eixo vertical invertido
++void ps2PadSetMouseTuning(float sensitivity, bool invertY);
++void ps2PadGetMouseTuning(float &sensitivity, bool &invertY);
++// Botoes (mascara do PS2) que o jogo nunca ve pressionados (ex.: Options do menu principal aberto pelo port)
++void ps2PadSetSuppressedButtons(uint16_t mask);
++// Faz o jogo ver os botoes pressionados por `ms` milissegundos (ignora a supressao)
++void ps2PadInjectButtons(uint16_t mask, int ms);
 +
  class PSPadBackend
  {
@@ -6375,7 +6388,7 @@ index 37b6a4d..e4bd0df 100644
 +    }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..0a4e7ca 100644
+index 8590f14..14936b5 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
 @@ -1,6 +1,14 @@
@@ -6393,7 +6406,7 @@ index 8590f14..0a4e7ca 100644
  
  namespace
  {
-@@ -23,6 +31,179 @@ namespace
+@@ -23,6 +31,221 @@ namespace
      constexpr uint16_t PAD_L1 = 0x0400u;
      constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
@@ -6418,10 +6431,15 @@ index 8590f14..0a4e7ca 100644
 +        }
 +    };
 +
++    MouseConfig &mouseConfigMutable()
++    {
++        static MouseConfig cfg;
++        return cfg;
++    }
++
 +    const MouseConfig &mouseConfig()
 +    {
-+        static const MouseConfig cfg;
-+        return cfg;
++        return mouseConfigMutable();
 +    }
 +
 +    // Preenchido pela thread da janela (ps2PadSampleHostInput) e consumido pela thread do jogo (readState).
@@ -6494,6 +6512,43 @@ index 8590f14..0a4e7ca 100644
 +    m.moveLeft[0] = KEY_A;
 +    m.moveRight[0] = KEY_D;
 +    return m;
++}
++
++namespace
++{
++    std::atomic<uint16_t> g_suppressed{0u};
++    std::atomic<uint16_t> g_injected{0u};
++    std::atomic<int64_t> g_injectUntilMs{0};
++
++    int64_t padNowMs()
++    {
++        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    }
++}
++
++void ps2PadSetSuppressedButtons(uint16_t mask)
++{
++    g_suppressed.store(mask, std::memory_order_relaxed);
++}
++
++void ps2PadInjectButtons(uint16_t mask, int ms)
++{
++    g_injected.store(mask, std::memory_order_relaxed);
++    g_injectUntilMs.store(padNowMs() + ms, std::memory_order_release);
++}
++
++void ps2PadSetMouseTuning(float sensitivity, bool invertY)
++{
++    MouseConfig &cfg = mouseConfigMutable();
++    cfg.sens = std::clamp(sensitivity, 0.5f, 40.0f);
++    cfg.invertY = invertY;
++}
++
++void ps2PadGetMouseTuning(float &sensitivity, bool &invertY)
++{
++    const MouseConfig &cfg = mouseConfig();
++    sensitivity = cfg.sens;
++    invertY = cfg.invertY;
 +}
 +
 +void ps2PadSetKeyMap(const Ps2PadKeyMap &map)
@@ -6573,7 +6628,7 @@ index 8590f14..0a4e7ca 100644
  }
  
  bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
-@@ -36,6 +217,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -36,6 +259,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[2] = 0xFF;
      data[3] = 0xFF;
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
@@ -6582,7 +6637,7 @@ index 8590f14..0a4e7ca 100644
  
      uint16_t btns = 0xFFFFu;
      constexpr int kGamepad = 0;
-@@ -87,36 +270,45 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -87,38 +312,52 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
          data[4] = static_cast<uint8_t>(128 + rx * 127);
          data[5] = static_cast<uint8_t>(128 + ry * 127);
      }
@@ -6639,8 +6694,8 @@ index 8590f14..0a4e7ca 100644
 +            data[6] = static_cast<uint8_t>(128 + static_cast<int>(dx * tilt * 127.0f));
 +            data[7] = static_cast<uint8_t>(128 + static_cast<int>(dy * tilt * 127.0f));
 +        }
-+    }
-+
+     }
+ 
 +    {
 +        std::lock_guard<std::mutex> lock(g_mouse.mutex);
 +        if (g_mouse.captured)
@@ -6654,11 +6709,18 @@ index 8590f14..0a4e7ca 100644
 +            data[5] = addAxis(data[5], g_mouse.dy);
 +            g_mouse.dx = g_mouse.dy = 0.0f;
 +        }
-     }
- 
++    }
++
++    // Supressao e injecao pelo port (bit em 1 = solto)
++    btns |= g_suppressed.load(std::memory_order_relaxed);
++    if (padNowMs() < g_injectUntilMs.load(std::memory_order_acquire))
++        btns &= static_cast<uint16_t>(~g_injected.load(std::memory_order_relaxed));
++
      data[2] = static_cast<uint8_t>(btns & 0xFF);
+     data[3] = static_cast<uint8_t>(btns >> 8);
+     return true;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..1ded370 100644
+index 45cb9d2..62d7bdb 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,3 +1,5 @@
@@ -6693,7 +6755,7 @@ index 45cb9d2..1ded370 100644
  #include <unordered_map>
  #include <sstream>
  
-@@ -37,6 +46,359 @@ namespace ps2_stubs
+@@ -37,6 +46,376 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -6836,6 +6898,7 @@ index 45cb9d2..1ded370 100644
 +        bool mouseArmed = false; // o mouse so conta depois de se mover com a caixa aberta (ver abaixo)
 +    } g_quitConfirm;
 +    Ps2QuitDialogDrawer g_quitDrawer = nullptr;
++    bool g_overlayOpen = false; // menu de opcoes do port aberto (ps2SetOverlayHandler)
 +
 +    constexpr int kPadIndex = 0;
 +
@@ -6877,7 +6940,7 @@ index 45cb9d2..1ded370 100644
 +        }
 +        if (!g_quitConfirm.open)
 +        {
-+            if (g_portMenu.open || g_portMenu.releasePending || g_quitConfirm.releasePending ||
++            if (g_portMenu.open || g_portMenu.releasePending || g_quitConfirm.releasePending || g_overlayOpen ||
 +                !g_backExitEnabled.load(std::memory_order_relaxed) || !backButtonPressed())
 +                return PortMenuAction::None;
 +            g_quitConfirm.open = true;
@@ -6998,6 +7061,22 @@ index 45cb9d2..1ded370 100644
 +
 +namespace
 +{
++    Ps2OverlayHandler g_overlayHandler = nullptr;
++    std::atomic<bool> g_frameFilterSharp{false};
++}
++
++void ps2SetOverlayHandler(Ps2OverlayHandler handler)
++{
++    g_overlayHandler = handler;
++}
++
++void ps2SetFrameFilterSharp(bool sharp)
++{
++    g_frameFilterSharp.store(sharp, std::memory_order_relaxed);
++}
++
++namespace
++{
 +    Ps2PreBootHook g_preBootHook = nullptr;
 +}
 +
@@ -7053,7 +7132,7 @@ index 45cb9d2..1ded370 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -92,6 +454,26 @@ namespace
+@@ -92,6 +471,26 @@ namespace
      constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
      constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
  
@@ -7080,7 +7159,7 @@ index 45cb9d2..1ded370 100644
      constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
      constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
      constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
-@@ -373,6 +755,19 @@ namespace
+@@ -373,6 +772,19 @@ namespace
      }
  }
  
@@ -7100,7 +7179,7 @@ index 45cb9d2..1ded370 100644
  static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
  {
      static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-@@ -388,13 +783,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -388,13 +800,15 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
  
      const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
      const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -7118,7 +7197,7 @@ index 45cb9d2..1ded370 100644
      {
          outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
          outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-@@ -407,7 +804,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -407,7 +821,13 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      uint32_t displayFbp = 0u;
      uint32_t sourceFbp = 0u;
      bool usedPreferredDisplaySource = false;
@@ -7133,7 +7212,7 @@ index 45cb9d2..1ded370 100644
                                                     width,
                                                     height,
                                                     &displayFbp,
-@@ -450,6 +853,33 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -450,6 +870,33 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_lastWidth = width;
      s_lastHeight = height;
  
@@ -7167,7 +7246,7 @@ index 45cb9d2..1ded370 100644
      std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
      if (!s_scratch.empty() && width != 0u && height != 0u)
      {
-@@ -505,6 +935,13 @@ PS2Runtime::PS2Runtime()
+@@ -505,6 +952,13 @@ PS2Runtime::PS2Runtime()
      m_guestHeapConfigured = false;
      m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
      m_asyncCallbackStackTop = PS2_RAM_SIZE;
@@ -7181,7 +7260,7 @@ index 45cb9d2..1ded370 100644
  }
  
  void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
-@@ -564,36 +1001,134 @@ PS2Runtime::~PS2Runtime()
+@@ -564,36 +1018,134 @@ PS2Runtime::~PS2Runtime()
      }
  }
  
@@ -7316,7 +7395,7 @@ index 45cb9d2..1ded370 100644
      auto scope = m_iopHost->enterCall(ctx, rdram);
      request.callToken = scope.token();
      return m_iopSubsystem->handleRpc(request);
-@@ -601,52 +1136,120 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
+@@ -601,52 +1153,120 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
  
  void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
  {
@@ -7438,7 +7517,7 @@ index 45cb9d2..1ded370 100644
      return m_iopSubsystem && m_iopSubsystem->isMemoryRange(address, size);
  }
  
-@@ -665,6 +1268,8 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -665,6 +1285,8 @@ bool PS2Runtime::syncCoreSubsystems()
      }
  
      m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
@@ -7447,7 +7526,7 @@ index 45cb9d2..1ded370 100644
      m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                      { m_gs.processGIFPacket(data, size); });
      m_memory.setGifArbiter(&m_gifArbiter);
-@@ -732,11 +1337,43 @@ bool PS2Runtime::initialize(const char *title)
+@@ -732,11 +1354,43 @@ bool PS2Runtime::initialize(const char *title)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
          SetConfigFlags(FLAG_WINDOW_RESIZABLE);
@@ -7492,7 +7571,7 @@ index 45cb9d2..1ded370 100644
          if (m_debugUiInitCallback)
          {
              m_debugUiInitCallback(*this, m_debugUiUserData);
-@@ -974,6 +1611,20 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
+@@ -974,6 +1628,20 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
          const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
          m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
          m_asyncCallbackStackTop = PS2_RAM_SIZE;
@@ -7513,7 +7592,7 @@ index 45cb9d2..1ded370 100644
      }
  
      LoadedModule module;
-@@ -1677,6 +2328,11 @@ void PS2Runtime::ensureGuestHeapInitializedLocked()
+@@ -1677,6 +2345,11 @@ void PS2Runtime::ensureGuestHeapInitializedLocked()
          return;
      }
  
@@ -7525,7 +7604,7 @@ index 45cb9d2..1ded370 100644
      const uint32_t suggested = (m_guestHeapSuggestedBase == 0u) ? kGuestHeapDefaultBase : m_guestHeapSuggestedBase;
      resetGuestHeapLocked(suggested, clampGuestHeapLimit(0u));
  }
-@@ -1804,9 +2460,21 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
+@@ -1804,9 +2477,21 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
      coalesceGuestHeapLocked();
  }
  
@@ -7547,7 +7626,7 @@ index 45cb9d2..1ded370 100644
      uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
      if (normalizedBase == 0u)
      {
-@@ -2388,6 +3056,63 @@ void PS2Runtime::run()
+@@ -2388,6 +3073,63 @@ void PS2Runtime::run()
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
@@ -7611,7 +7690,7 @@ index 45cb9d2..1ded370 100644
          PS2_IF_AGRESSIVE_LOGS({
              tick++;
              if ((tick % 120) == 0)
-@@ -2410,6 +3135,9 @@ void PS2Runtime::run()
+@@ -2410,6 +3152,9 @@ void PS2Runtime::run()
                                                 << " gp=0x" << dbgGp
                                                 << " dispfb1=0x" << gs.dispfb1
                                                 << " display1=0x" << gs.display1
@@ -7621,7 +7700,7 @@ index 45cb9d2..1ded370 100644
                                                 << std::dec
                                                 << " activeThreads=" << eeSnapshot.threads.size()
                                                 << " dma=" << curDma
-@@ -2417,6 +3145,49 @@ void PS2Runtime::run()
+@@ -2417,6 +3162,49 @@ void PS2Runtime::run()
                                                 << " gsw=" << curGs
                                                 << " vif=" << curVif
                                                 << std::endl);
@@ -7671,7 +7750,7 @@ index 45cb9d2..1ded370 100644
  
              }
          });
-@@ -2424,15 +3195,57 @@ void PS2Runtime::run()
+@@ -2424,28 +3212,100 @@ void PS2Runtime::run()
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
  
@@ -7732,12 +7811,35 @@ index 45cb9d2..1ded370 100644
          const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
          const Rectangle dstRect{
              (screenWidth - dstWidth) * 0.5f,
-@@ -2444,8 +3257,19 @@ void PS2Runtime::run()
+             (screenHeight - dstHeight) * 0.5f,
+             dstWidth,
+             dstHeight};
++        {
++            static int s_filter = -1;
++            const int filter = g_frameFilterSharp.load(std::memory_order_relaxed) ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR;
++            if (filter != s_filter || frameTex.id != 0u)
++            {
++                if (filter != s_filter)
++                    SetTextureFilter(frameTex, filter);
++                s_filter = filter;
++            }
++        }
+         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+         if (m_debugUiInitialized && m_debugUiDrawCallback)
          {
              m_debugUiDrawCallback(*this, m_debugUiUserData);
          }
 +        PortMenuAction menuAction = updateAndDrawPortMenu();
-+        if (menuAction == PortMenuAction::None)
++        // Overlay (menu de opcoes do port): enquanto aberto, o jogo nao recebe o controle
++        if (g_overlayHandler && !g_quitConfirm.open)
++        {
++            const float gameRect[4] = {dstRect.x, dstRect.y, dstRect.width, dstRect.height};
++            const bool open = g_overlayHandler(gameRect);
++            if (open != g_overlayOpen)
++                ps2PadSetBlocked(open);
++            g_overlayOpen = open;
++        }
++        if (menuAction == PortMenuAction::None && !g_overlayOpen)
 +            menuAction = updateAndDrawQuitConfirm(dstRect);
 +        (void)ps2DebugMenuUpdateAndDraw(m_memory.getRDRAM());
          EndDrawing();
@@ -7752,7 +7854,7 @@ index 45cb9d2..1ded370 100644
          if (WindowShouldClose())
          {
              RUNTIME_LOG("[run] window close requested, breaking out of loop");
-@@ -2459,6 +3283,7 @@ void PS2Runtime::run()
+@@ -2459,6 +3319,7 @@ void PS2Runtime::run()
      {
          gameThread.join();
      }

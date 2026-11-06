@@ -95,7 +95,10 @@ namespace
         const std::string leaf = discPath.substr(discPath.find_last_of('/') + 1);
         auto under = [&](const char *dir) { return u.rfind(dir, 0) == 0; };
         if (under("PSS/"))
-            return "movies/" + leaf;
+        {
+            // .mpg como no GTA Vice City: o .PSS ja e um MPEG Program Stream, o nome muda e os bytes nao
+            return "movies/" + leaf.substr(0, leaf.find_last_of('.')) + ".mpg";
+        }
         if (u == "STREAMS.DAT" || u == "BANKS.DAT")
             return "audio/" + leaf;
         if (u == "SWAT.DAT")
@@ -277,10 +280,43 @@ namespace
     }
 }
 
+// Instalacoes antigas tem movies/*.PSS: renomeia e atualiza o disc.vdisc (texto: LSN, tamanho, caminho)
+static void migrateMovies(const fs::path &root)
+{
+    const fs::path file = root / "system" / "disc.vdisc";
+    std::ifstream in(file, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    bool changed = false;
+    std::error_code ec;
+    for (size_t pos = text.find("../movies/"); pos != std::string::npos; pos = text.find("../movies/", pos + 1u))
+    {
+        const size_t end = text.find('\n', pos);
+        if (end == std::string::npos || end < pos + 4u || upper(text.substr(end - 4u, 4u)) != ".PSS")
+            continue;
+        const std::string oldRel = text.substr(pos + 3u, end - pos - 3u);
+        const std::string newRel = oldRel.substr(0, oldRel.size() - 4u) + ".mpg";
+        fs::rename(root / fs::u8path(oldRel), root / fs::u8path(newRel), ec);
+        if (ec)
+            return; // o resto fica para a proxima abertura; o disc.vdisc so muda com o arquivo no lugar
+        text.replace(pos + 3u, oldRel.size(), newRel);
+        changed = true;
+        std::ofstream(file, std::ios::binary) << text;
+    }
+    (void)changed;
+}
+
 bool rdrIsInstalled(const fs::path &root)
 {
     std::error_code ec;
-    return fs::exists(root / "system" / "disc.vdisc", ec) && fs::exists(root / "system" / "SLUS_205.00", ec);
+    const bool installed = fs::exists(root / "system" / "disc.vdisc", ec) && fs::exists(root / "system" / "SLUS_205.00", ec);
+    static bool s_migrated = false;
+    if (installed && !s_migrated)
+    {
+        s_migrated = true;
+        migrateMovies(root);
+    }
+    return installed;
 }
 
 // Instala a partir da ISO. Retorna "" se deu certo, senao a mensagem de erro (em ingles, mostrada no lancador).

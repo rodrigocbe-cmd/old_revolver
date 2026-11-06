@@ -1,4 +1,5 @@
 // Funcoes do Windows usadas pelo lancador e pelos saves (separadas: windows.h conflita com raylib).
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,47 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #endif
+
+// Modo da janela do jogo. O ToggleBorderlessWindowed do raylib deixa a janela sempre no topo: o Alt+Tab nao a tirava
+// da frente e, sem foco ao abrir, a barra de tarefas ficava por cima. Aqui a janela sem borda e uma janela comum do
+// tamanho do monitor; com foco, o Windows a trata como tela cheia e a barra some. width/height = area do jogo em
+// janela (0 = 3/4 da area de trabalho).
+void rdrWin32ApplyWindowMode(void *window, bool fullscreen, int width, int height)
+{
+#if defined(_WIN32)
+    HWND hwnd = static_cast<HWND>(window);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!hwnd || !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi))
+        return;
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    RECT r = mi.rcMonitor;
+    if (fullscreen)
+    {
+        style = (style & ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW)) | WS_POPUP | WS_VISIBLE;
+    }
+    else
+    {
+        style = (style & ~static_cast<LONG_PTR>(WS_POPUP)) | WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        const int workW = mi.rcWork.right - mi.rcWork.left, workH = mi.rcWork.bottom - mi.rcWork.top;
+        const int w = width > 0 ? width : workW * 3 / 4, h = height > 0 ? height : workH * 3 / 4;
+        r = {0, 0, w, h};
+        AdjustWindowRectEx(&r, static_cast<DWORD>(style), FALSE, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)));
+        const int outerW = (std::min)(static_cast<int>(r.right - r.left), workW);
+        const int outerH = (std::min)(static_cast<int>(r.bottom - r.top), workH);
+        r.left = mi.rcWork.left + (workW - outerW) / 2;
+        r.top = mi.rcWork.top + (workH - outerH) / 2;
+        r.right = r.left + outerW;
+        r.bottom = r.top + outerH;
+    }
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    SetForegroundWindow(hwnd);
+    BringWindowToTop(hwnd);
+#else
+    (void)window, (void)fullscreen, (void)width, (void)height;
+#endif
+}
 
 std::filesystem::path rdrExePath()
 {

@@ -33,9 +33,14 @@ if ($Scenario -eq 'gameplay') {
 
 $gsName = if ($Gpu) { 'gpu' } else { 'software' }
 if ($Gpu) { $env:PS2X_GS_BACKEND = 'parallel' } else { $env:PS2X_GS_BACKEND = 'software' }
+# As extras da medicao anterior nao podem valer nesta (RDR_LEVEL_REDIRECT vazou de level_fps_test para soak na
+# mesma sessao e a "regressao" do tutorial era a fase ranch, 2026-11-05)
+foreach ($k in @($global:RdrMeasureEnvKeys)) { if ($k) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue } }
+$global:RdrMeasureEnvKeys = @()
 foreach ($kv in ($Env -split ',' | Where-Object { $_ })) {
     $k, $v = $kv -split '=', 2
     Set-Item -Path "Env:$($k.Trim())" -Value $v
+    $global:RdrMeasureEnvKeys += $k.Trim()
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'

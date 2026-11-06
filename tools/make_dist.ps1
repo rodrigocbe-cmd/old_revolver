@@ -8,8 +8,12 @@ $build = Join-Path $root 'out\build\ps2xRuntime'
 $exe = Join-Path $build 'ps2EntryRunner.exe'
 if (-not (Test-Path $exe)) { throw "build nao encontrado: $exe (rode scripts\3_build.ps1)" }
 $name = "RedDeadRevolver-v$Version"
-$dist = Join-Path $root "dist\$name"
-if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+# Monta numa pasta temporaria: dist\$name pode ter uma instalacao do jogador (system\, movies\, audio\...), que nao pode
+# ser apagada nem entrar no zip. Ao final, so os arquivos do programa sao copiados por cima.
+$installed = Join-Path $root "dist\$name"
+$stage = Join-Path $root "dist\.stage"
+$dist = Join-Path $stage $name
+if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force $dist, (Join-Path $dist 'launcher') | Out-Null
 
 Copy-Item $exe (Join-Path $dist 'RedDeadRevolver.exe')
@@ -68,5 +72,8 @@ $zip = Join-Path $root "dist\$name.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path $dist -DestinationPath $zip
 $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
-"pacote: $dist"
+New-Item -ItemType Directory -Force $installed | Out-Null
+Copy-Item (Join-Path $dist '*') $installed -Recurse -Force
+Remove-Item $stage -Recurse -Force
+"pacote: $installed"
 "zip:    $zip ($size MB)"

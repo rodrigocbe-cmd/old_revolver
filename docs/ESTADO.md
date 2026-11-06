@@ -497,3 +497,57 @@ Próximo passo:
 2. Generalizar: guardar o sp de cada despacho de retorno e comparar com o sp do quadro que chamou.
 
 O override de leitura do Dave agora só age se a original terminou (`ctx->pc == ra`) e limita a cópia ao tamanho pedido (`a2`). Isso não era a causa do travamento.
+
+**2026-11-02 (noite): travamento sp−16 corrigido.**
+
+Causa: com o `[spcall]` (novo log no `dispatchGuestBranch`), a chamada `0x236700` → `FUN_00182718` voltou com sp−16 e ra `0x182758`. O `FUN_00182718` percorre uma árvore, e os métodos virtuais (`jalr` em `0x182750`) chamam o `FUN_00182718` de novo. Quando o checkpoint caía nessa chamada recursiva, `ctx->pc` ficava igual à entrada, e o `dispatchGuestBranch` de fora entendia "pc == entrada" como stub em C++ terminado. O `FUN_00236568` seguia então com o sp do quadro interno. O escalonador estava certo; a "continuação duplicada" das notas anteriores era isso.
+
+Correção (runtime, FUNCOES.md #96): o contador `m_guestBailouts` conta as saídas antecipadas do código gerado. "pc == entrada" só vale como término se não houve nenhuma saída durante a chamada; senão a chamada fica incompleta e o escalonador a retoma.
+
+Resultado: 3 rodadas de 10 min de gameplay sem travar (antes eram 6 de 8), sem `[spcheck]` e sem `PC invalido`. Logs: `run_20261102_200058/201100/202102_drive.log`, FPS em regime ~260 por janela.
+
+Em aberto (**hipótese**, não trava): o `[spcall]` ainda acusa retorno normal (`entrada=0 saidas=0`) com sp menor em:
+- `0x100f74` → `0x100b60` (−128/−256), que tem `jr $a0` em tabela e uma segunda cópia `entry_100b40`. Pode ser uma troca de contexto/corrotina do motor;
+- `0x1419fc` → `0x1418b8` (−224, uma vez −1568 = 7 quadros);
+- `0x3f7940` → `0x3f7800` (−16, raro).
+
+Próximo passo: olhar `FUN_00100b60` no Ghidra (troca de pilha intencional?). Os diagnósticos `RDR_GUARD_236568`/`ps2SetSpExpectation` podem sair quando isso fechar.
+
+**2026-11-04: FPS com SSAA 16 (4K, RTX 3060).**
+
+- Gameplay (tutorial) a 250 FINISH/600 (~25 fps). Antes da leitura em buffer duplo da GPU era ~11 fps.
+- Perfil (`logs/prof_20261104_063439`): a thread do jogo gasta 52% no VU1, 63% inclusivo no `drainMfifo` → VIF1 → microprogramas. A GPU não é o limite.
+- Flags mortas do VU1 (#71) religadas, agora padrão em `tools/vu1_recomp.py` (`--no-dead-flags` desliga): 995 de 3.464 pares deixam de gravar MAC/status. O travamento que fez desligá-las era o bug do sp−16 (#96). Resultado: **~278 FINISH/600 (~27,8 fps)**, 3 de 3 rodadas sem travar.
+- Novo `tools/level_fps_test.ps1`: fps por fase via `RDR_LEVEL_REDIRECT=hng=<fase>`. A varredura das 35 fases está em `logs/level_fps_20261104.txt`.
+
+Próximo passo: atacar as fases mais lentas. Candidatos para o VU1: tempo resolvido na geração (sem o anel de flags em execução) ou VU1/VIF1 numa thread própria.
+
+**2026-11-05: fases lentas e correções de medição.**
+
+- A varredura de 2026-11-04 com `hng=<fase>` não valeu: com save vazio o Novo jogo carrega `perfnew`. `tools/level_fps_test.ps1` agora usa `-From perfnew`.
+- Rodadas de 300 s pegam pouco gameplay: use 600 s nas fases. O log deve mostrar `[rdr] fase perfnew -> <fase>`; sem isso, a rodada ficou no menu.
+- `measure.ps1` vazava as variáveis extras entre medições da mesma sessão (corrigido). A "queda do tutorial" para 122/145 era a fase `ranch` por esse vazamento.
+- `tools/cost_report.py <logs>`: ms do EE por quadro e por mil MSCAL, para comparar versões em cenas diferentes.
+- VU1: `out/vu1mpg` foi de 12 para 15 microprogramas (capturados em gameplay de `msn`/`ranch`; antes caíam no interpretador). `merged_chains` do `vu1_recomp.py` gera uma cadeia por combinação de variantes (até 32): 41 programas estáticos. Custo por mil MSCAL: `msn` 84 → 52 ms, `ranch` 57 → 44 ms. Tutorial 278 → 292 FINISH/600.
+- Agrupar o `accountCycles` a cada 1024 ciclos foi testado e removido: 2 rodadas com, 2 sem, sem ganho de fps (276 contra 292).
+
+FPS com SSAA 16 em 4K, 600 s (`logs/level_fps_ssaa16_20261105.txt`): `royale` 27,1; `core` 25,6; `msn` 19,2; `woods` 16,2; `ranch` 15,1. EE ocupado 50–65 ms por quadro nas piores; 45–60% é `drainMfifo` → VIF1 → VU1 na thread do jogo.
+
+Logo da tela de título: as três texturas 256×128 (PSMT8) são desenhadas pelo Flash `logo01` acima do topo da tela (y do GS 1455–1750, centro ≈ 2048 − 448), paradas. Falta nos dois backends do GS, com ou sem widescreen e com ou sem o override #91. Causa não encontrada; próximo passo é ler o `logo01` extraído do FRONT.DAT.
+
+**2026-11-05 (tarde): VIF1 em thread própria, menu e logo.**
+
+- VIF1 em thread própria (FUNCOES.md #99, ligado por padrão desde esta sessão; `PS2X_VIF1_ASYNC=0` desliga): em SSAA 16 / 4K, `msn` 19,2 → 24,3 fps (EE 49 → 29 ms/quadro) e `ranch` 15,1 → 27,8 fps (esta rodada voltou ao menu no meio; repetir). As esperas por `sync` zeraram.
+- Com a opção ligada, `msn` e `ranch` voltaram ao menu no meio de algumas rodadas (`msn > front > msn`). **Hipótese:** o personagem parado morre antes porque o jogo anda mais rápido. Não confirmado.
+- Menu PC Settings: opções de Picture/Sound incluídas e "Game Options" removido (#98).
+- Logo do título aparece (#97), com correção de posição; causa real desconhecida.
+- Com o build padrão, SSAA 16 / 4K: tutorial 30,1 fps em 2 rodadas (limite do jogo, EE 15,5 ms/quadro); `woods` 23,3. Falta medir `royale`, `core` e `ranch` de novo. Com o EE ocioso ~4,8 s por janela na `woods`, o gargalo agora é a thread do VU1.
+- Janela (#100): tela cheia sem "sempre no topo", Window Mode e Resolution valem na hora, Widescreen do jogo acompanha o Aspect Ratio.
+
+Próximos passos: confirmar se a volta ao menu no meio de `msn`/`ranch` é o personagem morrendo; achar por que o logo do título fica acima da tela nos dados do Flash; reduzir o custo do VU1 (ver FUNCOES.md #71, #99).
+
+Medição final (build padrão, SSAA 16 / 4K, `logs/run_20261105_12*`): tutorial 30,1 fps. A `msn` voltou ao menu de novo no meio da rodada (`msn > front`) e a `ranch` não chegou à fase, então estas duas seguem sem número final com o build padrão. `[rdr] widescreen do jogo -> 1` e `[rdr] logo do titulo` confirmados no log. Distribuição `dist/RedDeadRevolver-v0.1.0` gerada com este build.
+
+**Pendente: ícones de controle na loja (pedido do usuário, 2026-11-05):** a tela SHOP mostra ✕ Done e □ Buy This Item como texturas de 32×32 PSMT8 (GS: 9677 com CLUT 9673 e 9669 com CLUT 9665; ✕ em x 1855–1880, y 2203–2233). Os pixels não foram achados por forma em nenhum `.pck` extraído; 9669 aparece também no título, então a origem é comum. Plano: registrar um hash dos uploads de 32×32 PSMT8 e das CLUTs no frontend do GS para identificar os dois ícones, e trocar os bytes no upload por uma tecla desenhada, reaproveitando `drawKeyCap`. Falta também conferir o menu antes da fase (`popups_01_ingame.pck`). `tools/pck_bitmaps.py` e `tools/avm1_dump.py` ajudam a analisar os `.pck`. Para chegar à loja: a cópia do save do usuário abre nela sozinha depois de ~2 min.
+
+**Vídeos (2026-11-05, #103, #104):** `movies/*.mpg` são os PSS renomeados, e um vídeo comum com o mesmo nome toca no lugar do original. Para editar: `tools/fmv_audio_test.ps1 -Only <NOME>` grava o som e `tools/export_movies.py game/disc/PSS out/movies_mp4 --only <NOME>` gera o `.mp4` (RSLOGO e TITLES já gerados). Falta decodificar o ADPCM do PSS para exportar sem gravar em tempo real.

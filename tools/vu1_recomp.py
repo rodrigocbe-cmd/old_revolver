@@ -20,9 +20,10 @@ import sys
 
 NAME = re.compile(r'mpg_([0-9a-f]{4})_(\d+)_([0-9a-f]{16})\.bin$')
 CODE_MASK = 0x3FFF
-# Eliminacao de flags mortas (#71) so com --dead-flags: com ela o jogo travou 2 de 2 vezes ao entrar no gameplay
-# (thread principal do EE com PC lixo), sem divergencia nas 12 mil execucoes verificadas. Investigar antes de ligar.
-NO_DEAD_FLAGS = '--dead-flags' not in sys.argv
+# Eliminacao de flags mortas (#71), ligada por padrao (--no-dead-flags desliga). O travamento ao entrar no gameplay
+# que a fez ser desligada era o bug do sp-16 no dispatchGuestBranch (#96), nao o VU1: com ele corrigido, 3 de 3
+# rodadas sem travar e gameplay com SSAA 16 de 250 para ~278 FINISH/600 (2026-11-04).
+NO_DEAD_FLAGS = '--no-dead-flags' in sys.argv
 
 
 class Unsupported(Exception):
@@ -552,22 +553,32 @@ def generate(path, out_dir, pair_only):
 def merged_chains(src):
     """Blocos MPG contiguos (o fim de um e o destino do proximo) que formam um programa so.
 
-    Os jogos enviam programas grandes em varios MPG; os desvios atravessam a divisa entre blocos. Junta so
-    enderecos com uma unica variante (sem ambiguidade de qual bloco segue qual)."""
+    Os jogos enviam programas grandes em varios MPG; os desvios atravessam a divisa entre blocos. Enderecos com
+    mais de uma variante geram uma cadeia por combinacao (ate MAX_CHAINS); o runtime escolhe pelo hash do que
+    esta carregado, entao combinacoes que nunca acontecem so ocupam espaco. RDR: a variante 2740_ae01 (fases
+    msn/ranch) termina num desvio com o delay slot no bloco seguinte e so compila junto com ele."""
+    MAX_CHAINS = 32
     by_dest = {}
     for name in sorted(os.listdir(src)):
         m = NAME.search(name)
         if m:
-            by_dest.setdefault(int(m.group(1), 16), []).append(os.path.join(src, name))
-    single = {d: open(v[0], 'rb').read() for d, v in by_dest.items() if len(v) == 1}
+            by_dest.setdefault(int(m.group(1), 16), []).append(open(os.path.join(src, name), 'rb').read())
+    ends = {d + len(v) for d, vs in by_dest.items() for v in vs}
     chains = []
-    starts = [d for d in sorted(single) if not any(o + len(single[o]) == d for o in single)]
-    for d in starts:
-        chain = [d]
-        while chain[-1] + len(single[chain[-1]]) in single:
-            chain.append(chain[-1] + len(single[chain[-1]]))
-        if len(chain) > 1:
-            chains.append((d, b''.join(single[x] for x in chain), chain))
+
+    def walk(d, parts, chain):
+        if len(chains) >= MAX_CHAINS:
+            return
+        for v in by_dest[d]:
+            nd = d + len(v)
+            if nd in by_dest:
+                walk(nd, parts + [v], chain + [d])
+            elif chain:
+                chains.append((chain[0], b''.join(parts + [v]), chain + [d]))
+
+    for d in sorted(by_dest):
+        if d not in ends:
+            walk(d, [], [])
     return chains
 
 

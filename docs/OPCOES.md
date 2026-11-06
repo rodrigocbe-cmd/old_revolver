@@ -59,6 +59,10 @@ Onde cada opção pode viver:
 
 As opções de PC ficam em `Documentos\Red Dead Revolver\settings.ini`, ao lado do `controls.ini`, e o menu só edita esse arquivo. Assim valem também para quem abre pelo lançador ou pela Steam.
 
+## Situação (2026-11-05)
+
+As opções do Options original (Picture e Sound) agora estão no menu PC Settings e "Game Options" saiu: Display (Brightness, Horizontal e Vertical Position), Audio (Music, SFX, Audio Mode) e a nova página Interface (Subtitles). Widescreen é o item Aspect Ratio. Detalhes em FUNCOES.md #98.
+
 ## Tamanho dos textos
 
 - **Menus nossos** (o novo menu de opções, a caixa de saída, o lançador): o texto deixa de crescer com a tela inteira. Medido pela altura da janela, o corpo fica em ~1,8% (≈20 px em 1080p, ≈39 px em 4K) e os títulos em ~3%. Hoje a caixa de saída e o lançador usam uma escala proporcional a 640x448, e o texto fica do tamanho do original do PS2 ampliado. Com o texto menor cabem mais opções por tela, como no RDR2.

@@ -1,0 +1,188 @@
+{
+  "jogo": "Red Dead Revolver",
+  "console": "PlayStation 2",
+  "fonte": "https://retroachievements.org/game/11094",
+  "total_conquistas": 20,
+  "conquistas": [
+    {
+      "id": 1,
+      "titulo_en": "The Scorpion's Scar",
+      "titulo_pt": "A Cicatriz do Escorpião",
+      "descricao_en": "Valiantly hold the fort at Harlow's Home in Chapter 1, \"Bull's Eye\"",
+      "descricao_pt": "Resista bravamente na defesa da Casa dos Harlow no Capítulo 1, \"Na Mosca\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534750.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534750_lock.png"
+    },
+    {
+      "id": 2,
+      "titulo_en": "Prime Cut",
+      "titulo_pt": "Corte Nobre",
+      "descricao_en": "Tenderize Bloody Tom's beefy ambitions during the events of Chapter 2, \"Bounty Hunter\"",
+      "descricao_pt": "Amacie as ambições avantajadas do Bloody Tom durante os eventos do Capítulo 2, \"Caçador de Recompensas\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533226.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533226_lock.png"
+    },
+    {
+      "id": 3,
+      "titulo_en": "The Uglier They Come, the Harder They Fall",
+      "titulo_pt": "Quanto Mais Feio, Maior o Tombo",
+      "descricao_en": "Neatly nix the Ugly Gang by the end of Chapter 3, \"Ugly Streetfight\"",
+      "descricao_pt": "Liquide com capricho a Gangue dos Ugly até o fim do Capítulo 3, \"Briga de Rua dos Ugly\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534749.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534749_lock.png"
+    },
+    {
+      "id": 4,
+      "titulo_en": "Tickets Please!",
+      "titulo_pt": "Bilhetes, Por Favor!",
+      "descricao_en": "Derail the Pedrosa Brothers' train heist during Chapter 5, \"Railroaded\"",
+      "descricao_pt": "Descarrilhe o assalto ao trem dos Irmãos Pedrosa durante o Capítulo 5, \"Nos Trilhos\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/531653.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/531653_lock.png"
+    },
+    {
+      "id": 5,
+      "titulo_en": "Explosive Pig Out",
+      "titulo_pt": "Banquete Explosivo",
+      "descricao_en": "Wrangle the dynamite-fiend during the events of Chapter 6, \"Carnival Life\"",
+      "descricao_pt": "Dome o maníaco da dinamite durante os eventos do Capítulo 6, \"Vida de Circo\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533227.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533227_lock.png"
+    },
+    {
+      "id": 6,
+      "titulo_en": "Perry's Peculiar Predicament",
+      "titulo_pt": "A Peculiar Provação de Perry",
+      "descricao_en": "Topple Perry's eccentric circus troupe in Chapter 7, \"Freak Show\"",
+      "descricao_pt": "Derrube a excêntrica trupe circense de Perry no Capítulo 7, \"Show de Aberrações\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533228.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533228_lock.png"
+    },
+    {
+      "id": 7,
+      "titulo_en": "Bovine Beatdown",
+      "titulo_pt": "Surra Bovina",
+      "descricao_en": "Rein in Bad Bessie's gang of outlaws during Chapter 8, \"Rogue Valley\"",
+      "descricao_pt": "Ponha rédeas no bando de fora-da-lei da Bad Bessie durante o Capítulo 8, \"Vale Renegado\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533229.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533229_lock.png"
+    },
+    {
+      "id": 8,
+      "titulo_en": "One Hell of a Bounty Hunter",
+      "titulo_pt": "Um Caçador de Recompensas e Tanto",
+      "descricao_en": "Close out all of Sheriff Bartlett's bounties by the end of Chapter 10, \"The Cemetery\"",
+      "descricao_pt": "Feche todas as recompensas do Xerife Bartlett até o fim do Capítulo 10, \"O Cemitério\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533230.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533230_lock.png"
+    },
+    {
+      "id": 9,
+      "titulo_en": "Faithful Buckaroo",
+      "titulo_pt": "Vaqueiro Fiel",
+      "descricao_en": "Accomplish the defense of Annie's cattle from the raiders in Chapter 11, \"Range War\"",
+      "descricao_pt": "Defenda com sucesso o gado da Annie dos saqueadores no Capítulo 11, \"Guerra de Pastagens\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533231.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533231_lock.png"
+    },
+    {
+      "id": 10,
+      "titulo_en": "The Final Curtain",
+      "titulo_pt": "O Pano Final",
+      "descricao_en": "Survive a storm of fists, bottles and bullets during Chapter 12, \"Saloon Fight\"",
+      "descricao_pt": "Sobreviva a uma tempestade de socos, garrafas e balas durante o Capítulo 12, \"Briga de Saloon\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533232.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533232_lock.png"
+    },
+    {
+      "id": 11,
+      "titulo_en": "Pact of Perdition",
+      "titulo_pt": "Pacto da Perdição",
+      "descricao_en": "Unearth the deceitful secrets behind Red's parents' fate by the end of Chapter 13, \"The Traitor\"",
+      "descricao_pt": "Desenterre os segredos traiçoeiros por trás do destino dos pais de Red até o fim do Capítulo 13, \"O Traidor\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533233.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533233_lock.png"
+    },
+    {
+      "id": 12,
+      "titulo_en": "Bullion's Folly",
+      "titulo_pt": "A Loucura dos Lingotes",
+      "descricao_en": "Disrupt an illicit gold operation during the events of Chapter 14, \"Sunset Canyon\"",
+      "descricao_pt": "Frustre uma operação ilícita de ouro durante os eventos do Capítulo 14, \"Desfiladeiro do Poente\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533442.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533442_lock.png"
+    },
+    {
+      "id": 13,
+      "titulo_en": "Grizzly Passage",
+      "titulo_pt": "Travessia do Urso",
+      "descricao_en": "Successfully navigate the twisting creek in Chapter 15, \"Bear Mountain\"",
+      "descricao_pt": "Atravesse com sucesso o riacho sinuoso no Capítulo 15, \"Montanha do Urso\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/533702.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/533702_lock.png"
+    },
+    {
+      "id": 14,
+      "titulo_en": "Ore-some Parole",
+      "titulo_pt": "Soltura Mineral",
+      "descricao_en": "Escape the labyrinth of the mines within Chapter 17, \"The Mine\"",
+      "descricao_pt": "Escape do labirinto das minas no Capítulo 17, \"A Mina\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534460.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534460_lock.png"
+    },
+    {
+      "id": 15,
+      "titulo_en": "Coach Under Sundown",
+      "titulo_pt": "Diligência ao Entardecer",
+      "descricao_en": "Make it to Brimstone by stagecoach during Chapter 19, \"Hell's Pass\"",
+      "descricao_pt": "Chegue a Brimstone de diligência durante o Capítulo 19, \"Passagem do Inferno\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534459.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534459_lock.png"
+    },
+    {
+      "id": 16,
+      "titulo_en": "The Courage of Red Wolves",
+      "titulo_pt": "A Coragem dos Lobos Vermelhos",
+      "descricao_en": "Bring down the senior officer donning the shoulder-mounted armcannon in Chapter 20, \"Fort Diego\"",
+      "descricao_pt": "Derrube o oficial graduado que porta o canhão de braço montado no ombro no Capítulo 20, \"Forte Diego\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534670.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534670_lock.png"
+    },
+    {
+      "id": 17,
+      "titulo_en": "Pact of Retribution",
+      "titulo_pt": "Pacto da Vingança",
+      "descricao_en": "Deal the final blow to the Renegade Army during Chapter 22, \"Devils and Angels\"",
+      "descricao_pt": "Desfira o golpe final no Exército Renegado durante o Capítulo 22, \"Demônios e Anjos\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534669.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534669_lock.png"
+    },
+    {
+      "id": 18,
+      "titulo_en": "Dust Settler",
+      "titulo_pt": "A Poeira Assentou",
+      "descricao_en": "Emerge triumphant after vanquishing all Battle Royale adversaries in Chapter 24, \"Battle Finale\"",
+      "descricao_pt": "Saia triunfante após aniquilar todos os adversários do Battle Royale no Capítulo 24, \"Final de Batalha\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534674.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534674_lock.png"
+    },
+    {
+      "id": 19,
+      "titulo_en": "Straight Into the Griffon's Den",
+      "titulo_pt": "Direto na Cova do Griffon",
+      "descricao_en": "Breach the opulent manor within Chapter 25, \"The Siege\"",
+      "descricao_pt": "Invada a opulenta mansão no Capítulo 25, \"O Cerco\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534675.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534675_lock.png"
+    },
+    {
+      "id": 20,
+      "titulo_en": "Redemption",
+      "titulo_pt": "Redenção",
+      "descricao_en": "Conclude Red's story by completing Chapter 27, \"Fall From Grace\"",
+      "descricao_pt": "Conclua a história de Red completando o Capítulo 27, \"Queda em Desgraça\"",
+      "imagem_desbloqueada": "https://media.retroachievements.org/Badge/534747.png",
+      "imagem_bloqueada": "https://media.retroachievements.org/Badge/534747_lock.png"
+    }
+  ]
+}

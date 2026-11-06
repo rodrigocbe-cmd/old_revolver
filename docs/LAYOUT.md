@@ -38,7 +38,8 @@ ferramentas comuns abrem (mpg, wav/mp3, txt); arquivos soltos têm prioridade so
 
 ```
 RedDeadRevolver.exe            executável recompilado + DLLs (FFmpeg, SDL2 ...)
-movies/      *.pss  (fase C: aceitar também .mp4/.mpg com o mesmo nome)
+movies/      *.mpg  (bytes do .PSS original: vídeo MPEG-2 + áudio em canal privado da Sony)
+             um .mp4/.mkv/.mov/.webm/.mpg comum com o mesmo nome toca no lugar (qualquer resolução)
 audio/
   streams/   faixas extraídas do STREAMS.DAT (fase C: .wav/.ogg)
   banks/     bancos do BANKS.DAT

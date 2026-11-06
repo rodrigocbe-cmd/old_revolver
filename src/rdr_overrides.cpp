@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -29,7 +30,8 @@
 bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4]); // rdr_quit_dialog.cpp
 void rdrControlsLoad();                                                         // rdr_controls.cpp
 void rdrKeyIconsInstall(PS2Runtime &runtime);                                  // rdr_keyicons.cpp
-void rdrSettingsInstall();                                                      // rdr_settings.cpp
+void rdrFmvInstall(PS2Runtime &runtime);                                         // rdr_fmv.cpp
+void rdrSettingsInstall(PS2Runtime &runtime);                                                      // rdr_settings.cpp
 void rdrSettingsSetMainMenu(bool mainMenu);                                     // rdr_settings.cpp
 std::filesystem::path rdrDocumentsDirectory();                                 // rdr_win32.cpp
 
@@ -716,6 +718,51 @@ namespace
         g_origLevelLoad(rdram, ctx, runtime);
     }
 
+    // Logo da tela de titulo (FUNCOES.md #97): no pacote logo01.pck (SWAT.DAT) o sprite do logo (caractere 0x32,
+    // profundidade 29) esta em y = -144 px no palco de 640x480, acima da tela, e nenhum script o move. A posicao nova
+    // vem da imagem de referencia do jogo original; RDR_TITLE_LOGO_Y=<px> troca o valor. A busca na RAM so roda no boot:
+    // para logo depois de achar (ou depois de 10 minutos).
+    // O Flash copia a matriz para o objeto vivo como (x, y) em float, entao corrige tambem essas copias.
+    constexpr float kLogoX = 320.6f, kLogoOldY = -144.0f;
+    constexpr uint32_t kLogoScanEnd = 0x01F00000u; // antes da pilha (la ha copias temporarias)
+    bool g_logoDone = false;
+
+    void titleLogoPump(uint8_t *rdram)
+    {
+        if (g_logoDone)
+            return;
+        static const auto s_start = std::chrono::steady_clock::now();
+        static int s_framesLeft = -1;
+        if (std::chrono::steady_clock::now() - s_start > std::chrono::minutes(10) || s_framesLeft == 0)
+        {
+            g_logoDone = true;
+            return;
+        }
+        if (s_framesLeft > 0)
+            --s_framesLeft;
+        const char *env = std::getenv("RDR_TITLE_LOGO_Y");
+        const float y = env ? static_cast<float>(std::atof(env)) : 256.0f;
+        uint32_t oldBits = 0u, xBits = 0u;
+        std::memcpy(&oldBits, &kLogoOldY, 4);
+        std::memcpy(&xBits, &kLogoX, 4);
+        uint32_t *ram = reinterpret_cast<uint32_t *>(rdram);
+        int patched = 0;
+        for (size_t i = 0u; i + 1u < kLogoScanEnd / 4u; ++i)
+        {
+            if (ram[i] == xBits && ram[i + 1u] == oldBits)
+            {
+                std::memcpy(&ram[i + 1u], &y, 4);
+                ++patched;
+            }
+        }
+        if (patched > 0)
+        {
+            if (s_framesLeft < 0)
+                s_framesLeft = 300; // objetos do mesmo sprite criados logo depois
+            std::fprintf(stderr, "[rdr] logo do titulo: %d copias, y = %.0f\n", patched, y);
+        }
+    }
+
     // Travamento 0x510000 (docs/ESTADO.md): o ra de FUN_00236568 (sp+0x98 do quadro de 0xB0) aparece trocado.
     // Com RDR_GUARD_236568=1 o slot fica vigiado enquanto a funcao esta viva; o runtime registra quem o mudou.
     PS2Runtime::RecompiledFunction g_origFrameUpdate = nullptr;
@@ -837,6 +884,55 @@ namespace
     // dois comentarios viram os elementos novos (3 botoes centralizados) e os grupos/tabela dos modos do
     // escritorio passam a usa-los, com "voltar Quit" como 3o prompt. FUN_00123AE0(tela, modo) troca o modo dos
     // prompts: nos modos do escritorio o runtime abre "Quit game?" ao apertar voltar.
+    // Voltar com circulo, triangulo para Options/Remove (FUNCOES.md #101). No jogo original e o contrario, e no gameplay
+    // o triangulo recarrega, entao a troca so vale com menu na tela: cada tela que testa o triangulo marca o quadro em
+    // que rodou, e o inicio do quadro liga a troca na leitura do controle. RDR_MENU_BUTTONS=original desliga.
+    constexpr uint32_t kMenuScreens[] = {0x00116B98u, 0x0011DBB8u, 0x0011F0D8u, 0x001208B0u, 0x00123FF0u, 0x00127218u,
+                                         0x001288A0u, 0x00129E10u, 0x0012AD08u, 0x0012B058u, 0x0012C290u, 0x0012CDB0u,
+                                         0x0012F0E8u, 0x00130B00u, 0x00136280u, 0x001365D8u, 0x00137D38u};
+    constexpr size_t kMenuScreenCount = std::size(kMenuScreens);
+    PS2Runtime::RecompiledFunction g_origMenuScreen[kMenuScreenCount] = {};
+    uint64_t g_frameCounter = 0u, g_lastMenuFrame = 0u;
+    bool g_officeMenu = false, g_swapMenuButtons = false;
+
+    template <size_t I>
+    void menuScreenTick(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_lastMenuFrame = g_frameCounter;
+        static bool s_logged = false;
+        if (!s_logged)
+        {
+            s_logged = true;
+            std::fprintf(stderr, "[rdr] tela de menu 0x%x\n", kMenuScreens[I]);
+        }
+        g_origMenuScreen[I](rdram, ctx, runtime);
+    }
+
+    template <size_t... I>
+    void installMenuScreens(PS2Runtime &runtime, std::index_sequence<I...>)
+    {
+        ((g_origMenuScreen[I] = runtime.lookupFunction(kMenuScreens[I]), runtime.replaceFunction(kMenuScreens[I], menuScreenTick<I>)), ...);
+    }
+
+    // Os rodapes dos .swui acompanham a troca: BACK e ALT1 (e ALT2, que tambem usa o circulo) trocam de icone
+    void swapPromptTokens(std::string &line)
+    {
+        static const std::string kBack = "BUTTON_BACK", kAlt1 = "BUTTON_ALT1_OPTIONS", kAlt2 = "BUTTON_ALT2_MISC";
+        std::string out;
+        for (size_t i = 0u; i < line.size();)
+        {
+            if (line.compare(i, kBack.size(), kBack) == 0)
+                out += kAlt1, i += kBack.size();
+            else if (line.compare(i, kAlt1.size(), kAlt1) == 0)
+                out += kBack, i += kAlt1.size();
+            else if (line.compare(i, kAlt2.size(), kAlt2) == 0)
+                out += kBack, i += kAlt2.size();
+            else
+                out += line[i++];
+        }
+        line = std::move(out);
+    }
+
     PS2Runtime::RecompiledFunction g_origSwuiLoad = nullptr;
     PS2Runtime::RecompiledFunction g_origSwuiLine = nullptr;
     PS2Runtime::RecompiledFunction g_origPromptMode = nullptr;
@@ -906,19 +1002,20 @@ namespace
 
     void swuiLineRewrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (g_inFrontendButtons)
-        {
-            char *buf = reinterpret_cast<char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
-            std::string line(buf, strnlen(buf, 255));
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-                line.pop_back();
-            const std::string repl = roomPromptLine(line);
-            if (!repl.empty() && repl.size() < 255u) // o buffer da linha (FUN_00105290) tem 256 bytes
-            {
-                std::memcpy(buf, repl.c_str(), repl.size() + 1u);
-                std::fprintf(stderr, "[rdr] frontendbuttons: %s\n", repl.c_str());
-            }
-        }
+        char *buf = reinterpret_cast<char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
+        std::string line(buf, strnlen(buf, 255));
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+        std::string repl = g_inFrontendButtons ? roomPromptLine(line) : std::string();
+        const bool replaced = !repl.empty();
+        if (!replaced)
+            repl = line;
+        if (g_swapMenuButtons)
+            swapPromptTokens(repl);
+        if ((replaced || repl != line) && repl.size() < 255u) // o buffer da linha (FUN_00105290) tem 256 bytes
+            std::memcpy(buf, repl.c_str(), repl.size() + 1u);
+        if (replaced)
+            std::fprintf(stderr, "[rdr] frontendbuttons: %s\n", repl.c_str());
         g_origSwuiLine(rdram, ctx, runtime);
     }
 
@@ -934,6 +1031,7 @@ namespace
         }
         ps2SetBackExitEnabled(mode == "book" || mode == "poster" || mode == "journal");
         rdrSettingsSetMainMenu(mode == "book" || mode == "poster" || mode == "journal");
+        g_officeMenu = mode == "book" || mode == "poster" || mode == "journal";
         g_origPromptMode(rdram, ctx, runtime);
     }
 
@@ -972,6 +1070,7 @@ namespace
         runtime.replaceFunction(0x00228120u, levelLoadWithRedirect);
         g_origFmvPlay = runtime.lookupFunction(0x002361B0u);
         runtime.replaceFunction(0x002361B0u, fmvPlayWithRedirect);
+        rdrFmvInstall(runtime);
         g_origSwuiLoad = runtime.lookupFunction(0x00105290u);
         runtime.replaceFunction(0x00105290u, swuiLoadTracked);
         g_origSwuiLine = runtime.lookupFunction(0x001054C8u);
@@ -981,7 +1080,11 @@ namespace
         ps2SetQuitDialogDrawer(rdrDrawQuitDialog);
         rdrControlsLoad();
         rdrKeyIconsInstall(runtime);
-        rdrSettingsInstall();
+        rdrSettingsInstall(runtime);
+        const char *menuButtons = std::getenv("RDR_MENU_BUTTONS");
+        g_swapMenuButtons = !(menuButtons && std::strcmp(menuButtons, "original") == 0);
+        if (g_swapMenuButtons)
+            installMenuScreens(runtime, std::make_index_sequence<kMenuScreenCount>());
         loadExtraArgs();
         if (std::getenv("RDR_TRACE_PARAMS"))
         {
@@ -1067,3 +1170,29 @@ namespace
 }
 
 PS2_REGISTER_GAME_OVERRIDE("Red Dead Revolver (SLUS-20500)", "SLUS_205.00", 0u, kRdrUnpackedElfCrc32, applyRdrOverrides)
+
+void ps2PadSetSwapTriangleCircle(bool swap); // ps2_pad.cpp
+
+// Inicio de quadro (rdr_settings.cpp): menu ativo = alguma tela rodou nos ultimos quadros, ou o escritorio
+void rdrMenuButtonsPump()
+{
+    ++g_frameCounter;
+    if (!g_swapMenuButtons)
+        return;
+    const bool active = g_officeMenu || g_frameCounter - g_lastMenuFrame <= 3u;
+    static bool s_active = false;
+    if (active != s_active)
+    {
+        s_active = active;
+        static int s_logs = 0;
+        if (s_logs++ < 40)
+            std::fprintf(stderr, "[rdr] botoes de menu: %d\n", active ? 1 : 0);
+    }
+    ps2PadSetSwapTriangleCircle(active);
+}
+
+// Inicio de quadro (rdr_settings.cpp)
+void rdrTitleLogoPump(uint8_t *rdram)
+{
+    titleLogoPump(rdram);
+}

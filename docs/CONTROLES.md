@@ -28,7 +28,7 @@ Pedido do usuário (2026-11-01):
 | ✕ (`0xBA`) | pular, rolar esquivando | Espaço |
 | □ (`0xBD`) | usar, falar, abrir porta, cobertura, aceitar | E; alternativa: Q (cobertura no RDR2) |
 | ○ (`0xBE`) | soco, ataque corpo a corpo | F |
-| △ (`0xBC`) | recusar, pular, cancelar | Backspace |
+| △ (`0xBC`) | **recarregar** ("Press △ to reload", só pelo texto; não testado em jogo), recusar, pular, cancelar | Backspace |
 | L3 | agachar | Ctrl esq. |
 | R3 | zoom | Z |
 | START | pausa, menu | Esc (Enter também) |
@@ -75,3 +75,23 @@ Algumas telas são pacotes Flash próprios (`.pck`), com os ícones de botão co
 Para trocar esses ícones é preciso entender o formato `.pck` e achar os bitmaps dos botões. A troca usaria o mesmo override de `FUN_002C9F40` das fontes.
 
 Na caixa de saída do runtime, o "voltar", o confirmar e o cancelar também aceitam as teclas do mapa (△, ✕ e ○, via `ps2PadGetKeyMap`). Antes só valiam V e o 1 do teclado numérico.
+
+## Mapa do △ (2026-11-05)
+
+Levantado por análise estática (`swat.strtbl`, `swat_ps2.strtbl`, `.swui`, código gerado); nada foi testado apertando o botão.
+
+**Gameplay e diálogos (textos):**
+- recarregar: "Press △ to reload";
+- pular: "Press △ to Skip", "skip to gameplay", "skip tutorial", "skip training section";
+- recusar: "Press □ to Accept / Press △ to Decline";
+- voltar/encerrar no treino: "return to current exercise", "end training section".
+
+O código do gameplay não testa o bit `0x1000` direto (nenhuma ocorrência fora das telas de menu), então a leitura deve passar por outra camada. **Hipótese**, falta achar essa função.
+
+**Menus:**
+- `BUTTON_BACK` = △, `BUTTON_CONFIRM` = ✕, `BUTTON_ALT1_OPTIONS` = ○ (`rdr_overrides.cpp`, FUNCOES.md #86). `BUTTON_ALT2_MISC` ainda sem confirmação.
+- 11 telas `.swui` têm rodapé com `BUTTON_BACK`: `gamepicture`, `gamesound`, `gameplayeropt`, `mainoptions`, `mpmode`, `multioption_controls`, `multioption_menu`, `multioption_name`, `multioption_profile`, `multioption_sensitivity`, `storyselect`.
+- Cada tela lê a máscara em `obj+0x304`: △ (`0x1000`) e ○ (`0x2000`) são ações diferentes, e o △ costuma chamar `FUN_00104A48`.
+- 17 funções de tela testam `0x1000`: `0x116B98`, `0x11DBB8`, `0x11F0D8`, `0x1208B0`, `0x123FF0`, `0x127218`, `0x1288A0`, `0x129E10`, `0x12AD08`, `0x12B058`, `0x12C290`, `0x12CDB0`, `0x12F0E8`, `0x130B00`, `0x136280`, `0x1365D8`, `0x137D38`. Várias delas também testam □ junto com ✕.
+- Ícones fora das fontes: os `.pck` da loja e do menu antes da fase têm botões embutidos como imagem (acima).
+

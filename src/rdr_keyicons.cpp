@@ -356,37 +356,59 @@ namespace
         }
     }
 
-    void daveReadWithIcons(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    // A leitura de uma pagina pode ser interrompida por checkpoints e bloqueios, e a funcao original entao termina pelo
+    // escalonador, depois que o override ja voltou. Antes o override desistia nesse caso e a pagina ficava com os botoes
+    // do controle (R1 nas dicas de fase). Agora o retorno da leitura passa por daveReadDone, que sempre roda no fim.
+    uint32_t g_readDonePc = 0u; // PC livre na tabela de funcoes (a tabela so cobre a faixa do codigo do jogo)
+    struct PendingRead
     {
-        const uint32_t handle = GPR_U32(ctx, 4), dst = GPR_U32(ctx, 5), requested = GPR_U32(ctx, 6);
-        const uint32_t retPc = GPR_U32(ctx, 31);
-        const uint32_t entry = rd32(rdram + ((handle + 4) & 0x1FFFFFFu));
-        const uint32_t pos = rd32(rdram + ((handle + 8) & 0x1FFFFFFu));
-        const uint8_t *e = rdram + (entry & 0x1FFFFFFu);
-        const auto key = std::make_tuple(rd32(e + 4), rd32(e + 8), rd32(e + 12));
-        g_origRead(rdram, ctx, runtime);
-        // Leitura interrompida por um checkpoint do escalonador (ctx->pc no meio da funcao): v0 ainda nao e o
-        // resultado. Sem esta checagem a copia abaixo usava lixo como tamanho e estourava o destino (que pode ser
-        // um buffer de 4 KB na pilha da thread 1: travamento com PC invalido, docs/ESTADO.md).
-        if (ctx->pc != retPc)
+        uint32_t retPc, dst, requested, pos;
+        IconPage *page;
+    };
+    std::vector<PendingRead> g_pendingReads;
+
+    void daveReadDone(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        std::unique_lock<std::mutex> lock(g_mutex);
+        if (g_pendingReads.empty())
             return;
-        const uint32_t got = std::min(GPR_U32(ctx, 2), requested);
+        const PendingRead r = g_pendingReads.back();
+        g_pendingReads.pop_back();
+        ctx->pc = r.retPc;
+        SET_GPR_U32(ctx, 31, r.retPc);
+        const uint32_t got = std::min(GPR_U32(ctx, 2), r.requested);
         if (got == 0 || got > 0x01000000u)
             return;
-        std::lock_guard<std::mutex> lock(g_mutex);
-        auto it = g_pages.find(key);
-        if (it == g_pages.end())
-            return;
-        IconPage &p = it->second;
+        IconPage &p = *r.page;
         if (!p.built)
         {
             buildPage(p);
             std::fprintf(stderr, "[rdr] icones de tecla aplicados (%s, %zu glifo(s))\n", p.dat.filename().string().c_str(), p.glyphs.size());
         }
-        if (p.patched.empty() || pos >= p.patched.size())
+        if (p.patched.empty() || r.pos >= p.patched.size())
             return;
-        const uint32_t n = std::min<uint32_t>(got, static_cast<uint32_t>(p.patched.size()) - pos);
-        std::memcpy(rdram + (dst & 0x1FFFFFFu), p.patched.data() + pos, n);
+        const uint32_t n = std::min<uint32_t>(got, static_cast<uint32_t>(p.patched.size()) - r.pos);
+        std::memcpy(rdram + (r.dst & 0x1FFFFFFu), p.patched.data() + r.pos, n);
+    }
+
+    void daveReadWithIcons(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t handle = GPR_U32(ctx, 4);
+        const uint32_t entry = rd32(rdram + ((handle + 4) & 0x1FFFFFFu));
+        const uint8_t *e = rdram + (entry & 0x1FFFFFFu);
+        const auto key = std::make_tuple(rd32(e + 4), rd32(e + 8), rd32(e + 12));
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_pages.find(key);
+            if (it != g_pages.end() && g_readDonePc != 0u)
+            {
+                g_pendingReads.push_back({GPR_U32(ctx, 31), GPR_U32(ctx, 5), GPR_U32(ctx, 6),
+                                          rd32(rdram + ((handle + 8) & 0x1FFFFFFu)), &it->second});
+                SET_GPR_U32(ctx, 31, g_readDonePc);
+            }
+        }
+        g_origRead(rdram, ctx, runtime);
     }
 
     // .DAT do disco: no instalado, os listados no disc.vdisc; no desenvolvimento, os da pasta do ELF
@@ -440,7 +462,13 @@ void rdrKeyIconsInstall(PS2Runtime &runtime)
     }
     g_origRead = runtime.lookupFunction(0x002C9F40u);
     if (g_origRead)
+    {
         runtime.replaceFunction(0x002C9F40u, daveReadWithIcons);
+        for (uint32_t pc = 0x00100000u; pc < 0x00600000u && g_readDonePc == 0u; pc += 4u)
+            if (!runtime.hasFunction(pc) && runtime.replaceFunction(pc, daveReadDone))
+                g_readDonePc = pc;
+        std::fprintf(stderr, "[rdr] fim de leitura das fontes em 0x%x\n", g_readDonePc);
+    }
 }
 
 // Teclas trocadas (tela de ajuste): as paginas sao refeitas na proxima leitura (fontes ja carregadas so mudam

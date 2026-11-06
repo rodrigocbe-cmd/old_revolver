@@ -21,6 +21,10 @@ Copy-Item $exe (Join-Path $dist 'RedDeadRevolver.exe')
 Copy-Item $exe (Join-Path $dist 'RDR Launcher.exe')
 Get-ChildItem $build -Filter *.dll | Copy-Item -Destination $dist
 Copy-Item (Join-Path $root 'assets\launcher\Rye-Regular.ttf'), (Join-Path $root 'assets\launcher\OFL.txt') (Join-Path $dist 'launcher')
+# Conquistas (tela do lancador): lista e imagens
+New-Item -ItemType Directory -Force (Join-Path $dist 'achievements') | Out-Null
+Copy-Item (Join-Path $root 'achievements\achievements.json') (Join-Path $dist 'achievements')
+Copy-Item (Join-Path $root 'achievements\imagens') (Join-Path $dist 'achievements') -Recurse
 # Artes da colecao SteamGridDB (assets\SGDB, fora do git) para o "Add to Steam" do lancador
 $sgdb = Join-Path $root 'assets\SGDB'
 $art = @{ 'capsule.png' = 'RD Revolver - Capsules.png'; 'wide.png' = 'RD Revolver - Capsules 2.png'; 'hero.png' = 'RD Revolver - Hero.png'; 'logo.png' = 'RD Revolver - Logo.png'; 'icon.png' = 'RD Revolver - Icon.png' }

@@ -41,6 +41,7 @@ void rdrControlsSetWalkTilt(float t);                                           
 void rdrControlsApply();                                                          // rdr_controls.cpp
 void rdrWin32ApplyWindowMode(void *window, bool fullscreen, int width, int height); // rdr_win32.cpp
 void rdrMenuButtonsPump();                                                        // rdr_overrides.cpp
+void rdrAchievementsPump(uint8_t *rdram);                                          // rdr_achievements.cpp
 void rdrFmvOverlay();                                                             // rdr_fmv.cpp
 void rdrTitleLogoPump(uint8_t *rdram);                                            // rdr_overrides.cpp
 bool rdrControlsSave();                                                           // rdr_controls.cpp
@@ -194,6 +195,7 @@ namespace
         g_rdram.store(rdram, std::memory_order_release);
         rdrTitleLogoPump(rdram);
         rdrMenuButtonsPump();
+        rdrAchievementsPump(rdram);
         // O jogo comeca com Widescreen desligado no perfil: a proporcao do menu manda (bit 0 de +0x5C), via handler original
         static int s_widescreenTick = 0, s_widescreenTries = 0;
         if (++s_widescreenTick >= 60 && s_widescreenTries < 20)

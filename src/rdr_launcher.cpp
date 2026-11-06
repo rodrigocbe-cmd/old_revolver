@@ -22,6 +22,7 @@ namespace fs = std::filesystem;
 
 using RdrInstallProgress = std::function<void(uint64_t done, uint64_t total, const std::string &label)>;
 bool rdrIsInstalled(const fs::path &root);
+void rdrAchievementsScreen(const fs::path &root); // rdr_achievements.cpp
 std::string rdrInstallFromIso(const fs::path &isoPath, const fs::path &root, const RdrInstallProgress &progress);
 fs::path rdrExeDirectory();
 fs::path rdrExePath();
@@ -152,7 +153,7 @@ namespace
         bool installed = rdrIsInstalled(root);
         std::string status = installed ? "Ready to ride." : "Select your Red Dead Revolver (USA) disc image to install the game.";
         int selected = installed ? 0 : 1;
-        constexpr int kItems = 5;
+        constexpr int kItems = 6;
         std::thread steamWorker;
         std::atomic<bool> steamBusy{false}, steamDone{false};
         std::string steamResult;
@@ -169,9 +170,9 @@ namespace
             const int w = GetScreenWidth(), h = GetScreenHeight();
             const float s = h / 576.0f, t = static_cast<float>(GetTime());
             // ADD TO STEAM so depois da instalacao pela ISO (antes o jogo ainda nao existe na pasta)
-            const char *labels[kItems] = {"PLAY", "SELECT ROM", "ADD TO STEAM", "UNINSTALL", "QUIT"};
+            const char *labels[kItems] = {"PLAY", "SELECT ROM", "ACHIEVEMENTS", "ADD TO STEAM", "UNINSTALL", "QUIT"};
             const bool idle = !inst.running && !steamBusy;
-            const bool enabled[kItems] = {installed && idle, idle, installed && idle, installed && idle, idle};
+            const bool enabled[kItems] = {installed && idle, idle, idle, installed && idle, installed && idle, idle};
 
             if (inst.finished.exchange(false))
             {
@@ -206,7 +207,7 @@ namespace
                 if (enabled[selected])
                     break;
             }
-            const float menuX = 70 * s, menuY = 252 * s, itemH = 44 * s, itemSize = 32 * s;
+            const float menuX = 70 * s, menuY = 268 * s, itemH = 41 * s, itemSize = 32 * s;
             const Vector2 mouse = GetMousePosition();
             const bool mouseMoved = mouse.x != lastMouse.x || mouse.y != lastMouse.y;
             lastMouse = mouse;
@@ -225,9 +226,11 @@ namespace
             {
                 if (selected == 0)
                     result = 1;
-                else if (selected == 4)
+                else if (selected == 5)
                     result = -1;
                 else if (selected == 2)
+                    rdrAchievementsScreen(root);
+                else if (selected == 3)
                 {
                     // Steam aberto: nao fecha; um processo oculto grava o atalho quando o Steam fechar
                     if (rdrSteamRunning())
@@ -248,7 +251,7 @@ namespace
                         });
                     }
                 }
-                else if (selected == 3)
+                else if (selected == 4)
                 {
                     if (uninstall(root))
                         result = -1;

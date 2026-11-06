@@ -10,6 +10,8 @@
 #include "raylib.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +28,9 @@ namespace fs = std::filesystem;
 
 std::string rdrKeyName(int code);       // rdr_controls.cpp
 int rdrControlsPrimaryForPadBit(int bit); // rdr_controls.cpp (0 = sem tecla)
+// gs_parallel_bridge.cpp
+void ps2GsRegisterHdTexture(uint64_t key, uint32_t w, uint32_t h, std::vector<uint8_t> rgba);
+uint64_t ps2GsHistogramKey(const uint32_t *histogram, bool eightBit);
 
 namespace
 {
@@ -161,6 +166,8 @@ namespace
             if (d.size() < q + 4 + 4u * npages)
                 continue;
             std::map<int, std::vector<GlyphRect>> byPage;
+            for (uint32_t pg = 0; pg < npages; ++pg)
+                byPage[static_cast<int>(pg)];
             int page = 0;
             for (uint32_t i = 0; i < n; ++i)
             {
@@ -271,42 +278,92 @@ namespace
         return best;
     }
 
-    // Desenha uma tecla (fundo escuro, borda clara, rotulo branco) no retangulo do glifo
-    void drawKeyCap(std::vector<uint8_t> &tex, const GlyphRect &r, const std::string &label)
+    // Tecla no estilo do RDR2 (fundo preto, simbolo branco). put(x, y, cor) desenha na pagina original ou na ampliada.
+    template <typename Put>
+    void keyCapShape(const Put &put, const GlyphRect &r, const std::string &label, int clear, int fill, int ink)
     {
-        const int w = tex[0] | (tex[1] << 8), h = tex[2] | (tex[3] << 8);
-        const bool eight = tex.size() >= 14u + 1024u + static_cast<size_t>(w * h);
-        const int palCount = eight ? 256 : 16;
-        const size_t pixels = 14u + (eight ? 1024u : 64u);
-        if (!eight && tex.size() < pixels + static_cast<size_t>(w * h / 2))
-            return;
-        const uint8_t *pal = &tex[14];
-        const int clear = nearest(pal, palCount, 0, 0, 0, 0);
-        const int fill = nearest(pal, palCount, 38, 34, 30, 0x80);
-        const int border = nearest(pal, palCount, 205, 200, 190, 0x80);
-        const int ink = nearest(pal, palCount, 255, 255, 255, 0x80);
-        auto put = [&](int x, int y, int idx) {
-            if (x < 0 || y < 0 || x >= w || y >= h)
-                return;
-            const int i = y * w + x;
-            if (eight)
-                tex[pixels + i] = static_cast<uint8_t>(idx);
-            else
-            {
-                uint8_t &b = tex[pixels + i / 2];
-                b = (i & 1) ? static_cast<uint8_t>((b & 0x0F) | (idx << 4)) : static_cast<uint8_t>((b & 0xF0) | (idx & 15));
-            }
-        };
         // tecla com cantos arredondados (1 px)
         for (int y = 0; y < r.h; ++y)
             for (int x = 0; x < r.w; ++x)
             {
                 const bool corner = (x == 0 || x == r.w - 1) && (y == 0 || y == r.h - 1);
-                const bool edge = x == 0 || y == 0 || x == r.w - 1 || y == r.h - 1;
-                put(r.x + x, r.y + y, corner ? clear : edge ? border : fill);
+                put(r.x + x, r.y + y, corner ? clear : fill);
             }
+        const int t = std::max(2, r.h / 12); // espessura do traco
+        // Simbolos: coordenadas em 1/100 da tecla
+        const auto px = [&r](int v) { return r.x + v * r.w / 100; };
+        const auto py = [&r](int v) { return r.y + v * r.h / 100; };
+        auto rect = [&](int x0, int y0, int x1, int y1) {
+            for (int y = y0; y <= y1; ++y)
+                for (int x = x0; x <= x1; ++x)
+                    put(x, y, ink);
+        };
+        // Linha horizontal de 2 px com ponta de seta em tipX, apontando para dir (-1 ou 1)
+        auto arrowH = [&](int tipX, int tailX, int y, int dir) {
+            rect(std::min(tipX, tailX), y - t + 1, std::max(tipX, tailX), y);
+            const int head = std::max(3, r.h / 6);
+            for (int i = 0; i < head; ++i)
+                rect(tipX - dir * i, y - t + 1 - i, tipX - dir * i, y + i);
+        };
+        // Triangulo cheio (setas direcionais)
+        auto triangle = [&](int dx, int dy) {
+            const int cx = r.x + r.w / 2, cy = r.y + r.h / 2, n = r.h / 4;
+            for (int i = 0; i <= n; ++i)
+            {
+                const int d = n - 2 * i + n / 2;
+                if (dx != 0)
+                    rect(cx - dx * d - t, cy - i, cx - dx * d, cy + i);
+                else
+                    rect(cx - i, cy - dy * d - t, cx + i, cy - dy * d);
+            }
+        };
+        if (label == "ENT")
+        {
+            rect(px(70), py(26), px(70) + t - 1, py(62));
+            arrowH(px(20), px(70) + t - 1, py(62), -1);
+            return;
+        }
+        if (label == "BKS")
+        {
+            arrowH(px(12), px(88), py(50), -1);
+            return;
+        }
+        if (label == "TAB")
+        {
+            arrowH(px(84), px(16), py(34), 1);
+            arrowH(px(16), px(84), py(68), -1);
+            return;
+        }
+        if (label == "SPC")
+        {
+            rect(px(18), py(66), px(82), py(66) + t - 1);
+            rect(px(18), py(50), px(18) + t - 1, py(66));
+            rect(px(82) - t + 1, py(50), px(82), py(66));
+            return;
+        }
+        if (label == "SHF" || label == "RSH")
+        {
+            // Seta para cima vazada
+            const int cx = r.x + r.w / 2, top = py(20), wing = r.w / 4, mid = top + wing;
+            for (int i = 0; i <= wing; ++i)
+            {
+                rect(cx - i - t / 2, top + i, cx - i + t / 2, top + i);
+                rect(cx + i - t / 2, top + i, cx + i + t / 2, top + i);
+            }
+            rect(cx - wing, mid, cx - r.w / 8, mid + t - 1);
+            rect(cx + r.w / 8, mid, cx + wing, mid + t - 1);
+            rect(cx - r.w / 8, mid, cx - r.w / 8 + t - 1, py(78));
+            rect(cx + r.w / 8 - t + 1, mid, cx + r.w / 8, py(78));
+            rect(cx - r.w / 8, py(78) - t + 1, cx + r.w / 8, py(78));
+            return;
+        }
+        if (label == "<" || label == ">" || label == "^" || label == "v")
+        {
+            triangle(label == "<" ? -1 : label == ">" ? 1 : 0, label == "^" ? -1 : label == "v" ? 1 : 0);
+            return;
+        }
         // rotulo: escala 2 se couber, senao 1; centralizado
-        int scale = 2;
+        int scale = std::max(2, r.h / 12);
         auto textW = [&](int s) { return static_cast<int>(label.size()) * 6 * s - s; };
         while (scale > 1 && (textW(scale) > r.w - 4 || 7 * scale > r.h - 4))
             --scale;
@@ -319,6 +376,131 @@ namespace
                             for (int sy = 0; sy < scale; ++sy)
                                 for (int sx = 0; sx < scale; ++sx)
                                     put(tx + (static_cast<int>(c) * 6 + x) * scale + sx, ty + y * scale + sy, ink);
+    }
+
+    // Desenha a tecla na pagina indexada do jogo
+    void drawKeyCap(std::vector<uint8_t> &tex, const GlyphRect &r, const std::string &label)
+    {
+        const int w = tex[0] | (tex[1] << 8), h = tex[2] | (tex[3] << 8);
+        const bool eight = tex.size() >= 14u + 1024u + static_cast<size_t>(w * h);
+        const int palCount = eight ? 256 : 16;
+        const size_t pixels = 14u + (eight ? 1024u : 64u);
+        if (!eight && tex.size() < pixels + static_cast<size_t>(w * h / 2))
+            return;
+        const uint8_t *pal = &tex[14];
+        const int clear = nearest(pal, palCount, 0, 0, 0, 0);
+        const int fill = nearest(pal, palCount, 0, 0, 0, 0x80);
+        const int ink = nearest(pal, palCount, 240, 238, 232, 0x80);
+        auto put = [&](int x, int y, int idx) {
+            if (x < 0 || y < 0 || x >= w || y >= h)
+                return;
+            const int i = y * w + x;
+            if (eight)
+                tex[pixels + i] = static_cast<uint8_t>(idx);
+            else
+            {
+                uint8_t &b = tex[pixels + i / 2];
+                b = (i & 1) ? static_cast<uint8_t>((b & 0x0F) | (idx << 4)) : static_cast<uint8_t>((b & 0xF0) | (idx & 15));
+            }
+        };
+        keyCapShape(put, r, label, clear, fill, ink);
+    }
+
+    // Pagina de fonte ampliada 4x (FUNCOES.md #106): cobertura interpolada, borda reforcada e teclas redesenhadas na nova
+    // escala. O GS identifica a textura pelo histograma dos indices, que nao muda com a ordem dos pixels na memoria.
+    constexpr int kHdFactor = 4;
+
+    float cubic(const float *p, float t)
+    {
+        return p[1] + 0.5f * t * (p[2] - p[0] + t * (2.0f * p[0] - 5.0f * p[1] + 4.0f * p[2] - p[3] + t * (3.0f * (p[1] - p[2]) + p[3] - p[0])));
+    }
+
+    // Amplia um canal: primeiro as linhas, depois as colunas
+    std::vector<float> scaleChannel(const std::vector<float> &in, int w, int h)
+    {
+        const int W = w * kHdFactor, H = h * kHdFactor;
+        const auto phase = [](int i, int &base) {
+            const float pos = (static_cast<float>(i) + 0.5f) / kHdFactor - 0.5f;
+            base = static_cast<int>(std::floor(pos));
+            return pos - static_cast<float>(base);
+        };
+        std::vector<float> rows(static_cast<size_t>(W) * h), out(static_cast<size_t>(W) * H);
+        float p[4];
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < W; ++x)
+            {
+                int base = 0;
+                const float t = phase(x, base);
+                for (int k = 0; k < 4; ++k)
+                    p[k] = in[static_cast<size_t>(y) * w + std::clamp(base + k - 1, 0, w - 1)];
+                rows[static_cast<size_t>(y) * W + x] = cubic(p, t);
+            }
+        for (int y = 0; y < H; ++y)
+        {
+            int base = 0;
+            const float t = phase(y, base);
+            for (int x = 0; x < W; ++x)
+            {
+                for (int k = 0; k < 4; ++k)
+                    p[k] = rows[static_cast<size_t>(std::clamp(base + k - 1, 0, h - 1)) * W + x];
+                out[static_cast<size_t>(y) * W + x] = cubic(p, t);
+            }
+        }
+        return out;
+    }
+
+    void registerHdPage(const IconPage &p)
+    {
+        static const bool s_enabled = !(std::getenv("RDR_HD_FONTS") && std::getenv("RDR_HD_FONTS")[0] == '0');
+        const std::vector<uint8_t> &t = p.patched;
+        if (!s_enabled || t.size() < 14u)
+            return;
+        const int w = t[0] | (t[1] << 8), h = t[2] | (t[3] << 8);
+        const bool eight = t.size() >= 14u + 1024u + static_cast<size_t>(w * h);
+        const size_t pixels = 14u + (eight ? 1024u : 64u);
+        if (w == 0 || h == 0 || t.size() < pixels + static_cast<size_t>(eight ? w * h : w * h / 2))
+            return;
+        std::array<uint32_t, 256> histogram{};
+        std::vector<float> alpha(static_cast<size_t>(w) * h);
+        std::array<std::vector<float>, 3> color;
+        for (auto &c : color)
+            c.resize(alpha.size());
+        for (int i = 0; i < w * h; ++i)
+        {
+            const int idx = eight ? t[pixels + i] : (t[pixels + i / 2] >> ((i & 1) * 4)) & 15;
+            ++histogram[idx];
+            const uint8_t *c = &t[14 + idx * 4]; // B, G, R, A; alfa de 0 a 255, o jogo divide por 2 ao enviar a paleta
+            const float a = static_cast<float>((c[3] + 1) / 2);
+            alpha[i] = a;
+            for (int k = 0; k < 3; ++k)
+                color[k][i] = static_cast<float>(c[2 - k]) * a;
+        }
+        const std::vector<float> bigAlpha = scaleChannel(alpha, w, h);
+        const int W = w * kHdFactor, H = h * kHdFactor;
+        std::vector<uint8_t> rgba(static_cast<size_t>(W) * H * 4u);
+        for (int k = 0; k < 3; ++k)
+        {
+            const std::vector<float> big = scaleChannel(color[k], w, h);
+            for (size_t i = 0; i < big.size(); ++i)
+                rgba[i * 4u + k] = static_cast<uint8_t>(std::clamp(big[i] / std::max(bigAlpha[i], 1.0f), 0.0f, 255.0f));
+        }
+        for (size_t i = 0; i < bigAlpha.size(); ++i)
+        {
+            const float edge = std::clamp((bigAlpha[i] / 128.0f - 0.5f) * 1.6f + 0.5f, 0.0f, 1.0f);
+            rgba[i * 4u + 3u] = static_cast<uint8_t>(edge * edge * (3.0f - 2.0f * edge) * 128.0f + 0.5f);
+        }
+        auto put = [&rgba, W, H](int x, int y, int kind) {
+            if (x < 0 || y < 0 || x >= W || y >= H)
+                return;
+            uint8_t *d = &rgba[(static_cast<size_t>(y) * W + x) * 4u];
+            d[0] = d[1] = kind == 2 ? 240 : 0;
+            d[2] = kind == 2 ? 232 : 0;
+            d[3] = kind == 0 ? 0 : 128;
+        };
+        for (const GlyphRect &r : p.glyphs)
+            if (const int code = rdrControlsPrimaryForPadBit(r.padBit); code != 0)
+                keyCapShape(put, {r.padBit, r.x * kHdFactor, r.y * kHdFactor, r.w * kHdFactor, r.h * kHdFactor}, keyLabel(code), 0, 1, 2);
+        ps2GsRegisterHdTexture(ps2GsHistogramKey(histogram.data(), eight), static_cast<uint32_t>(W), static_cast<uint32_t>(H), std::move(rgba));
     }
 
     void buildPage(IconPage &p)
@@ -334,6 +516,7 @@ namespace
         for (const GlyphRect &r : p.glyphs)
             if (const int code = rdrControlsPrimaryForPadBit(r.padBit); code != 0)
                 drawKeyCap(p.patched, r, keyLabel(code));
+        registerHdPage(p);
         // RDR_DUMP_ICONS=<pasta>: grava a pagina corrigida em PNG (conferencia sem rodar ate a tela)
         if (const char *dir = std::getenv("RDR_DUMP_ICONS"); dir && dir[0])
         {

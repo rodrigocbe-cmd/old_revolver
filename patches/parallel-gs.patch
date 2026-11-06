@@ -1,0 +1,102 @@
+diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
+index ea00016..158158b 100644
+--- a/gs/gs_interface.cpp
++++ b/gs/gs_interface.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-FileContributor: Runar Heyer
+ // SPDX-License-Identifier: LGPL-3.0+
+ 
++#include <cstdio>
+ #include "page_tracker.hpp"
+ #include "gs_interface.hpp"
+ #include "gs_util.hpp"
+@@ -855,6 +856,9 @@ void GSInterface::shift_vertex_queue()
+ 	}
+ }
+ 
++// Textura em alta resolucao do port: devolve a imagem que substitui a textura deste endereco (nullptr = nenhuma)
++const Vulkan::ImageView *(*pgs_hook_texture_view)(uint32_t tbp, uint32_t psm) = nullptr;
++
+ void GSInterface::vertex_kick_xyz(Reg64<XYZBits> xyz)
+ {
+ 	shift_vertex_queue();
+@@ -1790,6 +1794,25 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 		info.info.bias.x = -float(desc.rect.x) * info.info.sizes.z;
+ 		info.info.bias.y = -float(desc.rect.y) * info.info.sizes.w;
+ 
++		// As coordenadas continuam no tamanho original; so a normalizacao passa a usar a textura inteira
++		if (pgs_hook_texture_view)
++		{
++			if (const Vulkan::ImageView *hd = pgs_hook_texture_view(uint32_t(desc.tex0.desc.TBP0), uint32_t(desc.tex0.desc.PSM)))
++			{
++				const float full_w = float(1u << uint32_t(desc.tex0.desc.TW));
++				const float full_h = float(1u << uint32_t(desc.tex0.desc.TH));
++				info.view = hd;
++				info.info.sizes.z = 1.0f / full_w;
++				info.info.sizes.w = 1.0f / full_h;
++				info.info.bias.x = 0.0f;
++				info.info.bias.y = 0.0f;
++				if (uint32_t(desc.clamp.desc.WMS) == CLAMPBits::CLAMP)
++					info.info.region.z = full_w - 1.0f;
++				if (uint32_t(desc.clamp.desc.WMT) == CLAMPBits::CLAMP)
++					info.info.region.w = full_h - 1.0f;
++			}
++		}
++
+ 		info.info.arrayed = int(desc.samples > 1);
+ 		info.info.flags = long_term_cache_texture ? TEX_INFO_LONG_TERM_REFERENCE : 0;
+ 		if (info.info.arrayed)
+@@ -2697,8 +2720,13 @@ void GSInterface::drawing_kick_append()
+ 	{
+ 		prim_attr.state |= 1u << STATE_BIT_PARALLELOGRAM;
+ 		prim_attr.state |= 1u << STATE_BIT_SPRITE;
+-		prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
+-		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
++		// A interface fica presa aos pixels nativos; uma textura HD precisa de amostragem por sample para render detalhe
++		if (!(registers.prim.desc.TME && pgs_hook_texture_view &&
++		      pgs_hook_texture_view(uint32_t(ctx.tex0.desc.TBP0), uint32_t(ctx.tex0.desc.PSM))))
++		{
++			prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
++			prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
++		}
+ 		prim_attr.state &= ~(1u << STATE_BIT_MULTISAMPLE);
+ 	}
+ 	else if (is_line)
+@@ -3175,6 +3203,10 @@ void GSInterface::read_transfer_fifo(void *data, uint32_t num_128b_words)
+ 	transfer_state.fifo_readback_128b_offset += to_copy;
+ }
+ 
++// Troca de texturas do port (ps2xRuntime gs_parallel_bridge.cpp): ve os uploads e pode redirecionar o TEX0.
++void (*pgs_hook_upload_begin)(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg) = nullptr;
++void (*pgs_hook_upload_data)(const uint64_t *qwords, size_t count) = nullptr;
++
+ void GSInterface::init_transfer()
+ {
+ 	flush_pending_transfer(false);
+@@ -3211,6 +3243,8 @@ void GSInterface::init_transfer()
+ 	}
+ 	else if (XDIR == HOST_TO_LOCAL)
+ 	{
++		if (pgs_hook_upload_begin)
++			pgs_hook_upload_begin(transfer_state.copy.bitbltbuf.bits, transfer_state.copy.trxpos.bits, transfer_state.copy.trxreg.bits);
+ 		transfer_state.required_qwords =
+ 				(transfer_state.copy.trxreg.desc.RRW *
+ 				transfer_state.copy.trxreg.desc.RRH *
+@@ -3959,6 +3993,8 @@ void GSInterface::a_d_HWREG(uint64_t payload)
+ {
+ 	if (transfer_state.host_to_local_active)
+ 	{
++		if (pgs_hook_upload_data)
++			pgs_hook_upload_data(&payload, 1);
+ 		transfer_state.host_to_local_payload.push_back(payload);
+ 		// Flush out transfer if enough data has been received.
+ 		check_pending_transfer();
+@@ -3969,6 +4005,8 @@ void GSInterface::a_d_HWREG_multi(const uint64_t *payload, size_t count)
+ {
+ 	if (transfer_state.host_to_local_active)
+ 	{
++		if (pgs_hook_upload_data)
++			pgs_hook_upload_data(payload, count);
+ 		transfer_state.host_to_local_payload.insert(transfer_state.host_to_local_payload.end(),
+ 													payload, payload + count);
+ 		// Flush out transfer if enough data has been received.

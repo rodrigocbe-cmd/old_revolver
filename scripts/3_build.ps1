@@ -25,6 +25,11 @@ if (-not $NoSync) {
 
     # GS na GPU (paraLLEl-GS, opcional): external/parallel-gs clonado com submodulos (FUNCOES.md #65)
     $pgs = Join-Path $RDR_ROOT 'external\parallel-gs'
+    $pgsPatch = Join-Path $RDR_ROOT 'patches\parallel-gs.patch'
+    if ((Test-Path (Join-Path $pgs 'gs')) -and (Test-Path $pgsPatch)) {
+        git -C $pgs apply --check $pgsPatch 2>$null
+        if ($LASTEXITCODE -eq 0) { git -C $pgs apply $pgsPatch; 'patch do paraLLEl-GS aplicado' }
+    }
     $pgsArg = if (Test-Path (Join-Path $pgs 'Granite\CMakeLists.txt')) { "-DPS2X_PARALLEL_GS_DIR=$pgs" } else { '-DPS2X_PARALLEL_GS_DIR=' }
     cmake -S $src -B $build -G Ninja "-DCMAKE_BUILD_TYPE=$Config" `
         -DPS2X_BUILD_RECOMP=OFF -DPS2X_BUILD_ANALYZER=OFF -DPS2X_BUILD_TEST=OFF -DPS2X_BUILD_STUDIO=OFF $pgsArg "-DPS2X_APP_ICON_RC=$(Join-Path $RDR_ROOT 'assets\icon\icon.rc')"

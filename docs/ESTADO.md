@@ -556,3 +556,11 @@ Medição final (build padrão, SSAA 16 / 4K, `logs/run_20261105_12*`): tutorial
 
 Cheat Engine: RAM do EE em `0x200000000` e scratchpad em `0x210000000` (`docs/MODS.md`). Leitura e escrita externas testadas por `ReadProcessMemory`/`WriteProcessMemory`.
 
+## 2026-11-06: texto em alta resolucao
+
+- Fontes do jogo ampliadas 4x em execucao e trocadas na GPU (FUNCOES.md #106); teclas no estilo do RDR2 (#107).
+- Medicao gameplay em GPU sem SSAA: 56,7 gs.finish, 0 erros. Ainda nao medido em SSAA 16.
+- Nao melhora: texto em Flash (loja, Press START, a confirmar) e logos em video (usar `movies/`).
+- Teclas com fundo preto e simbolo branco (pedido do usuario).
+- Traducao: extrator e motor prontos (FUNCOES.md #108, TRADUCAO.md). So ingles e portugues por enquanto. Teste em game/text/pt-br.txt (fora do git): Confirm, Change Name e Back trocados na tela de perfil, com acentos. Falta: texto longo estoura a caixa; nao testado em fase; rotulos de .swui e Flash nao passam por aqui.
+- Proximo: Flash pela loja. Distribuicao ainda sem estas mudancas.

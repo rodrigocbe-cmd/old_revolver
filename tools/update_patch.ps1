@@ -21,3 +21,12 @@ $state = if ((Get-FileHash $patch).Hash -ne $before) { 'atualizado' } else { 'se
 $newText = if ($new) { "novos: $($new -join ', ')" } else { 'nenhum arquivo novo' }
 "patch ${state}: $files arquivos, $size KB ($newText)"
 if (Select-String -Path $patch -Pattern '^diff --git a/ps2xRuntime/src/runner/' -Quiet) { 'ERRO: o patch contém código gerado (src/runner)'; exit 1 }
+
+# Hooks de texturas HD no paraLLEl-GS (FUNCOES.md #106): patch proprio, aplicado por 3_build.ps1
+$pgs = Join-Path $root 'external\parallel-gs'
+if (Test-Path $pgs) {
+    $pgsPatch = Join-Path $root 'patches\parallel-gs.patch'
+    $pgsDiff = git -C $pgs -c core.safecrlf=false diff -- gs
+    [System.IO.File]::WriteAllText($pgsPatch, (($pgsDiff -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding $false))
+    "parallel-gs.patch: $([math]::Round((Get-Item $pgsPatch).Length / 1KB)) KB"
+}

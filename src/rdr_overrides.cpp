@@ -35,6 +35,8 @@ void rdrSettingsInstall(PS2Runtime &runtime);                                   
 void rdrSettingsSetMainMenu(bool mainMenu);                                     // rdr_settings.cpp
 std::filesystem::path rdrDocumentsDirectory();                                 // rdr_win32.cpp
 
+void rdrTextInstall(PS2Runtime &runtime); // rdr_text.cpp
+
 namespace
 {
     constexpr uint32_t kRdrUnpackedElfCrc32 = 0xEF570C27u;
@@ -914,10 +916,10 @@ namespace
         ((g_origMenuScreen[I] = runtime.lookupFunction(kMenuScreens[I]), runtime.replaceFunction(kMenuScreens[I], menuScreenTick<I>)), ...);
     }
 
-    // Os rodapes dos .swui acompanham a troca: BACK e ALT1 (e ALT2, que tambem usa o circulo) trocam de icone
+    // Os rodapes dos .swui acompanham a troca: BACK e ALT1 trocam de icone. ALT2 (Change Name, botao quadrado) nao muda.
     void swapPromptTokens(std::string &line)
     {
-        static const std::string kBack = "BUTTON_BACK", kAlt1 = "BUTTON_ALT1_OPTIONS", kAlt2 = "BUTTON_ALT2_MISC";
+        static const std::string kBack = "BUTTON_BACK", kAlt1 = "BUTTON_ALT1_OPTIONS";
         std::string out;
         for (size_t i = 0u; i < line.size();)
         {
@@ -925,8 +927,6 @@ namespace
                 out += kAlt1, i += kBack.size();
             else if (line.compare(i, kAlt1.size(), kAlt1) == 0)
                 out += kBack, i += kAlt1.size();
-            else if (line.compare(i, kAlt2.size(), kAlt2) == 0)
-                out += kBack, i += kAlt2.size();
             else
                 out += line[i++];
         }
@@ -1037,6 +1037,7 @@ namespace
 
     void applyRdrOverrides(PS2Runtime &runtime)
     {
+        rdrTextInstall(runtime); // FUNCOES.md #108
         // Padrao ligado; RDR_CHECKED_FREE=0 desliga (FUNCOES.md #80).
         if (!(std::getenv("RDR_CHECKED_FREE") && std::getenv("RDR_CHECKED_FREE")[0] == '0'))
         {

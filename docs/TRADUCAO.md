@@ -1,17 +1,17 @@
 # Plano de tradução (pt-BR)
 
-Levantamento de 2026-11-05. Nada foi implementado ainda. Os textos traduzidos derivam do jogo e não entram no repositório sem decisão do usuário: a tradução é nova, mas o inglês de referência não.
+Levantamento de 2026-11-05; extrator e motor prontos em 2026-11-06. Por enquanto só inglês e português (decisão do usuário): inglês é o texto original, português vem de `text/pt-br.txt`. Os textos traduzidos derivam do jogo e não entram no repositório sem decisão do usuário: a tradução é nova, mas o inglês de referência não.
 
 ## Onde estão os textos
 
 | Origem | Volume | Como trocar |
 |---|---|---|
-| `.strtbl` (`swat.strtbl`, `swat_ps2.strtbl`, 37 `lvl_*.strtbl`) | ~3.000 textos, ~10.600 palavras (estimativa) | pela chave, ver abaixo |
+| `.strtbl` (`swat.strtbl`, `swat_ps2.strtbl`, 37 `lvl_*.strtbl`) | 1.634 textos, 8.770 palavras (extrator, sem Xbox e sem cópias de reserva) | pela chave, ver abaixo |
 | `.swui` (rótulos de menu: "Options", "Back") | dezenas por tela | `swuiLineRewrite` já reescreve linhas ao carregar |
 | `.pck` (Flash: telas de abertura, loja, popups) | a medir | texto como cache de imagem: é o caso mais difícil |
 | Imagens com texto (`.tex`) | a medir | trocar a textura |
 
-A estimativa veio de uma leitura simples dos arquivos: inclui textos sem uso e textos do Xbox, e pode ter deixado outros de fora. A contagem real sai da ferramenta da etapa 1.
+A contagem ainda inclui textos sem uso. Fontes usadas: berrylium 1.358, damaged 123, bosshealth 102, regulatorcondensed 49, instructions 2.
 
 ## Fontes
 
@@ -29,14 +29,14 @@ Para as fontes sem acento há duas saídas: desenhar os glifos nas páginas `.te
 
 ## Como aplicar
 
-Trocar na busca por chave, sem reescrever os `.strtbl`. `FUN_0017F398(chave)` devolve o objeto de texto (hipótese: visto em `FUN_00101BA8`, com o texto em `+8`). Um override procuraria a chave em `text/pt-br.txt` e devolveria o texto traduzido num buffer próprio. Assim o tamanho do texto pode mudar, e o arquivo do jogo fica intacto. Falta confirmar a função e o formato no Ghidra.
+Troca feita na busca por chave, sem reescrever os `.strtbl` (`src/rdr_text.cpp`). Confirmado: `FUN_0017F398(chave)` é a única entrada para `FUN_0017BF38` e devolve o objeto de texto, com a cadeia UTF-16 em `+8`, alocada por `FUN_00219E70` e liberada por `FUN_00219F70` no destrutor `FUN_0017B980`. O override procura a chave em `text/pt-br.txt` e troca a cadeia no objeto, então o tamanho do texto pode mudar e o arquivo do jogo fica intacto. O hash da chave diferencia maiúsculas de minúsculas. Cada entrada do `.strtbl` também traz fonte e escala, ainda não usadas. O arquivo tem lugar para 10 idiomas; só o primeiro está preenchido.
 
-Um arquivo por idioma na pasta `text/`, como o GTA VC, permite outras traduções depois. O menu PC Settings ganharia a opção de idioma.
+Um arquivo por idioma na pasta `text/`, como o GTA VC. `RDR_LANG` escolhe o idioma (padrão `pt-br`; sem arquivo, fica o original). O menu PC Settings ganhará a opção com inglês e português.
 
 ## Etapas
 
-1. **Extrator:** gerar `text/en.txt` (chave, texto, arquivo de origem) com todos os `.strtbl`, separando textos do PS2 e do Xbox.
-2. **Motor:** override da busca, com `text/pt-br.txt` e uma frase de teste na tela.
+1. **Extrator (pronto):** `python tools/text_extract.py game/disc out/text/en.txt`.
+2. **Motor (pronto):** frases de teste vistas na tela de perfil, com ç e ã. Texto longo passou da borda do papel em "Change Name".
 3. **Tradução dos menus:** `.strtbl` e `.swui`.
 4. **Tradução da história e das dicas:** o maior volume. Glifos de botão (`0xBA`...) precisam ficar no texto.
 5. **Fontes:** acentos nas fontes de título.

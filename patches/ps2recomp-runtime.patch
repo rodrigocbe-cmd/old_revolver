@@ -4474,10 +4474,10 @@ index 5658928..7ce3149 100644
      std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
 diff --git a/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp
 new file mode 100644
-index 0000000..cfaec33
+index 0000000..9c57e89
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_parallel_bridge.cpp
-@@ -0,0 +1,503 @@
+@@ -0,0 +1,719 @@
 +#include "gs_parallel_bridge.h"
 +
 +#include <cstdio>
@@ -4500,6 +4500,13 @@ index 0000000..cfaec33
 +#include "runtime/gs/gs_draw_stats.h"
 +#include "runtime/ps2_memory.h"
 +
++#include <fstream>
++#include <filesystem>
++#include <unordered_map>
++#include <atomic>
++#include <algorithm>
++#include <string>
++#include <vector>
 +void ps2GsNoteFinish() noexcept; // ps2_memory.cpp (FUNCOES.md #79)
 +
 +namespace
@@ -4783,12 +4790,218 @@ index 0000000..cfaec33
 +    }
 +}
 +
++namespace ParallelGS
++{
++    extern const Vulkan::ImageView *(*pgs_hook_texture_view)(uint32_t tbp, uint32_t psm);
++    extern void (*pgs_hook_upload_begin)(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg);
++    extern void (*pgs_hook_upload_data)(const uint64_t *qwords, size_t count);
++}
++
++// Texturas em alta resolucao (FUNCOES.md #106). O jogo envia texturas de 8 e 4 bits como PSMCT32 em (0,0), com os pixels
++// ja na ordem da memoria do GS (um 16x16 de 32 bits e um 32x32 de 8 bits). Cada upload ganha um hash do conteudo.
++// PS2X_TEX_DUMP=<pasta> grava <hash>_<L>x<A>_<psm>_<bloco>.bin. PS2X_TEX_HD=<pasta> com <hash>.hd (largura e altura em 16
++// bits, depois RGBA8, alfa do PS2 de 0 a 128): a imagem fica fora da memoria do GS, que nao tem espaco livre, e o
++// paraLLEl-GS a amostra no lugar da textura original com as mesmas coordenadas. O jogo tambem registra texturas geradas
++// em execucao (ps2GsRegisterHdTexture), identificadas pelo histograma dos indices.
++namespace
++{
++    struct HdTexture
++    {
++        uint16_t w = 0u, h = 0u;
++        std::vector<uint8_t> pixels;
++        Vulkan::ImageHandle image;
++    };
++
++    std::unordered_map<uint64_t, HdTexture> g_hdFiles;
++    std::unordered_map<uint32_t, const Vulkan::ImageView *> g_hdViews; // endereco no GS (tbp0)
++    std::string g_texDumpDir;
++
++    struct PendingHd
++    {
++        uint32_t w = 0u, h = 0u;
++        std::vector<uint8_t> rgba;
++    };
++    std::mutex g_hdPendingMutex; // o jogo registra na thread do EE; as imagens nascem na thread do GS
++    std::unordered_map<uint64_t, PendingHd> g_hdPending;
++
++    uint64_t histogramKey(const uint32_t *histogram, bool eightBit)
++    {
++        uint64_t hash = eightBit ? 1469598103934665603ull : 7809847782465536322ull;
++        for (int i = 0; i < 256; ++i)
++            hash = (hash ^ histogram[i]) * 1099511628211ull;
++        return hash;
++    }
++
++    // Upload de uma pagina conhecida: cria a imagem na primeira vez
++    const Vulkan::ImageView *hdViewForRegistered(uint64_t key)
++    {
++        const auto known = g_hdFiles.find(key);
++        if (known != g_hdFiles.end())
++            return known->second.image ? &known->second.image->get_view() : nullptr;
++        PendingHd pending;
++        {
++            std::lock_guard<std::mutex> lock(g_hdPendingMutex);
++            const auto it = g_hdPending.find(key);
++            if (it == g_hdPending.end())
++                return nullptr;
++            pending = std::move(it->second);
++            g_hdPending.erase(it);
++        }
++        HdTexture &t = g_hdFiles[key];
++        Vulkan::ImageCreateInfo info = Vulkan::ImageCreateInfo::immutable_2d_image(pending.w, pending.h, VK_FORMAT_R8G8B8A8_UNORM);
++        Vulkan::ImageInitialData initial = {};
++        initial.data = pending.rgba.data();
++        t.image = g_bridge->device.create_image(info, &initial);
++        return t.image ? &t.image->get_view() : nullptr;
++    }
++
++    struct UploadCapture
++    {
++        bool active = false;
++        uint32_t dbp = 0u, psm = 0u, w = 0u, h = 0u, need = 0u;
++        std::vector<uint8_t> bytes;
++    } g_capture;
++
++    void hdUploadDone()
++    {
++        g_capture.active = false;
++        if (g_capture.bytes.size() >= 2048u)
++        {
++            // Paginas geradas pelo jogo: o mesmo conteudo tem sempre o mesmo histograma, em 8 e em 4 bits
++            uint32_t bytes[256] = {}, nibbles[256] = {};
++            for (const uint8_t b : g_capture.bytes)
++            {
++                ++bytes[b];
++                ++nibbles[b & 15u];
++                ++nibbles[b >> 4];
++            }
++            const Vulkan::ImageView *view = hdViewForRegistered(histogramKey(bytes, true));
++            if (!view)
++                view = hdViewForRegistered(histogramKey(nibbles, false));
++            if (view)
++            {
++                g_hdViews[g_capture.dbp] = view;
++                return;
++            }
++        }
++        if (g_texDumpDir.empty() && g_hdFiles.empty())
++            return;
++        uint64_t hash = 1469598103934665603ull;
++        for (const uint8_t b : g_capture.bytes)
++            hash = (hash ^ b) * 1099511628211ull;
++        if (!g_texDumpDir.empty())
++        {
++            char name[96];
++            std::snprintf(name, sizeof(name), "/%016llx_%ux%u_%x_%u.bin", static_cast<unsigned long long>(hash), g_capture.w, g_capture.h, g_capture.psm, g_capture.dbp);
++            const std::string path = g_texDumpDir + name;
++            if (!std::filesystem::exists(path))
++                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(g_capture.bytes.data()), static_cast<std::streamsize>(g_capture.bytes.size()));
++        }
++        const auto it = g_hdFiles.find(hash);
++        if (it != g_hdFiles.end() && it->second.image)
++            g_hdViews[g_capture.dbp] = &it->second.image->get_view();
++    }
++
++    void hdHookBegin(uint64_t bitbltbuf, uint64_t trxpos, uint64_t trxreg)
++    {
++        UploadCapture &c = g_capture;
++        c.active = false;
++        c.dbp = static_cast<uint32_t>((bitbltbuf >> 32) & 0x3FFFu);
++        c.psm = static_cast<uint32_t>((bitbltbuf >> 56) & 0x3Fu);
++        c.w = static_cast<uint32_t>(trxreg & 0xFFFu);
++        c.h = static_cast<uint32_t>((trxreg >> 32) & 0xFFFu);
++        g_hdViews.erase(c.dbp); // qualquer escrita neste endereco invalida a troca anterior
++        const bool origin = ((trxpos >> 32) & 0x07FF07FFull) == 0ull;
++        const bool pow2 = c.w >= 8u && c.h >= 8u && (c.w & (c.w - 1u)) == 0u && (c.h & (c.h - 1u)) == 0u;
++        if ((c.psm != 0u && c.psm != 0x13u && c.psm != 0x14u) || !origin || !pow2)
++            return;
++        c.need = c.psm == 0u ? c.w * c.h * 4u : c.psm == 0x13u ? c.w * c.h : c.w * c.h / 2u;
++        c.bytes.clear();
++        c.bytes.reserve(c.need);
++        c.active = true;
++    }
++
++    void hdHookData(const uint64_t *qwords, size_t count)
++    {
++        UploadCapture &c = g_capture;
++        if (!c.active)
++            return;
++        const auto *src = reinterpret_cast<const uint8_t *>(qwords);
++        const size_t n = std::min<size_t>(count * 8u, c.need - c.bytes.size());
++        c.bytes.insert(c.bytes.end(), src, src + n);
++        if (c.bytes.size() >= c.need)
++            hdUploadDone();
++    }
++
++    const Vulkan::ImageView *hdHookView(uint32_t tbp, uint32_t psm)
++    {
++        if (g_hdViews.empty() || (psm != 0x13u && psm != 0x14u))
++            return nullptr;
++        const auto it = g_hdViews.find(tbp);
++        return it == g_hdViews.end() ? nullptr : it->second;
++    }
++
++    void hdInit()
++    {
++        if (const char *dump = std::getenv("PS2X_TEX_DUMP"); dump && dump[0])
++        {
++            g_texDumpDir = dump;
++            std::error_code ec;
++            std::filesystem::create_directories(g_texDumpDir, ec);
++        }
++        if (const char *dir = std::getenv("PS2X_TEX_HD"); dir && dir[0])
++        {
++            std::error_code ec;
++            for (const auto &entry : std::filesystem::directory_iterator(dir, ec))
++            {
++                if (entry.path().extension() != ".hd")
++                    continue;
++                std::ifstream in(entry.path(), std::ios::binary);
++                HdTexture t;
++                in.read(reinterpret_cast<char *>(&t.w), 2);
++                in.read(reinterpret_cast<char *>(&t.h), 2);
++                t.pixels.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++                if (t.w == 0u || t.h == 0u || t.pixels.size() != static_cast<size_t>(t.w) * t.h * 4u)
++                    continue;
++                Vulkan::ImageCreateInfo info = Vulkan::ImageCreateInfo::immutable_2d_image(t.w, t.h, VK_FORMAT_R8G8B8A8_UNORM);
++                Vulkan::ImageInitialData initial = {};
++                initial.data = t.pixels.data();
++                t.image = g_bridge->device.create_image(info, &initial);
++                t.pixels.clear();
++                t.pixels.shrink_to_fit();
++                if (t.image)
++                    g_hdFiles[std::strtoull(entry.path().stem().string().c_str(), nullptr, 16)] = std::move(t);
++            }
++            std::fprintf(stderr, "[gs-hd] %zu textura(s) em %s\n", g_hdFiles.size(), dir);
++        }
++        ParallelGS::pgs_hook_upload_begin = hdHookBegin;
++        ParallelGS::pgs_hook_upload_data = hdHookData;
++        ParallelGS::pgs_hook_texture_view = hdHookView;
++    }
++}
++
++void ps2GsRegisterHdTexture(uint64_t key, uint32_t w, uint32_t h, std::vector<uint8_t> rgba)
++{
++    std::lock_guard<std::mutex> lock(g_hdPendingMutex);
++    PendingHd &pending = g_hdPending[key];
++    pending.w = w;
++    pending.h = h;
++    pending.rgba = std::move(rgba);
++}
++
++uint64_t ps2GsHistogramKey(const uint32_t *histogram, bool eightBit)
++{
++    return histogramKey(histogram, eightBit);
++}
++
 +namespace
 +{
 +    void submitNow(uint32_t pathIndex, const uint8_t *data, uint32_t sizeBytes)
 +    {
 +        std::lock_guard<std::mutex> lock(g_bridge->mutex);
 +        Util::register_thread_index(0);
++        static const bool s_hdReady = (hdInit(), true);
++        (void)s_hdReady;
 +        // Os pacotes do runtime sao autocontidos: o VIF1 corta IMAGE do PATH2 e reembala cada pedaco com uma
 +        // tag IMAGE nova (ps2_vif1_interpreter.cpp emitDirectPayload). O paraLLEl-GS guarda o estado do caminho
 +        // entre transferencias e leria essa tag como pixel, desalinhando o fluxo. Comeca cada pacote numa tag.
@@ -4965,6 +5178,9 @@ index 0000000..cfaec33
 +}
 +
 +#else
++
++void ps2GsRegisterHdTexture(uint64_t, uint32_t, uint32_t, std::vector<uint8_t>) {}
++uint64_t ps2GsHistogramKey(const uint32_t *, bool) { return 0u; }
 +
 +namespace ps2_gs_parallel
 +{

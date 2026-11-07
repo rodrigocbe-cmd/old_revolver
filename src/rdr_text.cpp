@@ -1,7 +1,10 @@
-// Traducao (docs/TRADUCAO.md, FUNCOES.md #108): textos por chave em text/<idioma>.txt, sem alterar os .strtbl do jogo.
-// Formato do arquivo: UTF-8, uma linha "chave<TAB>texto", # comenta, escapes \n, \t, \\ e \uXXXX; texto vazio mantem o
-// original. tools/text_extract.py gera a base em ingles. Por enquanto ha ingles (o texto do jogo) e portugues.
-// Idioma: opcao Language do PC Settings; em Auto, o do sistema, com ingles se nao houver arquivo. RDR_LANG=en|pt-br fixa.
+// Traducao (docs/TRADUCAO.md, FUNCOES.md #108, #111): um arquivo por idioma em text/ (PT-BR.txt...), lidos ao iniciar.
+// Formato: UTF-8; a primeira linha "@language Nome" da o nome mostrado no menu (o id e o nome do arquivo); depois uma
+// linha "chave<TAB>texto" por texto; # comenta; escapes \n, \t, \\ e \uXXXX; texto vazio mantem o original.
+// As chaves sao as dos .strtbl do jogo (tools/text_extract.py gera a base) e, para os menus do port (PC Settings, caixa de
+// saida), o proprio texto em ingles. Ingles e o texto original e nao precisa de arquivo.
+// Idioma: opcao Language do PC Settings, guardada no settings.ini; sem escolha, o do Windows, ou ingles. RDR_LANG=<id> fixa.
+// RDR_TEXT_LOG=1 registra cada chave sem traducao uma vez (para montar arquivos novos).
 //
 // FUN_0017F398(chave) e a unica entrada para FUN_0017BF38 e devolve o objeto de texto, com a cadeia UTF-16 em +8, alocada
 // por FUN_00219E70 e liberada no destrutor FUN_0017B980. A troca aponta +8 para um bloco nosso, e o destrutor recebe o
@@ -14,29 +17,53 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <vector>
 
 namespace fs = std::filesystem;
+
+std::string rdrSystemLocaleName(); // rdr_win32.cpp ("pt-BR")
 
 namespace
 {
     constexpr uint32_t kRamMask = 0x1FFFFFFu;
 
+    struct Language
+    {
+        std::string id, name; // id = nome do arquivo sem .txt; ingles = "EN" sem arquivo
+        fs::path file;
+    };
+
+    std::vector<Language> g_languages;
+    std::once_flag g_scanOnce;
+    std::atomic<int> g_wanted{0};
+    bool g_fixed = false; // RDR_LANG
+    bool g_log = false;   // RDR_TEXT_LOG
+
+    // Menus do port (thread da janela)
+    std::mutex g_uiMutex;
+    std::unordered_map<std::string, std::string> g_ui;
+    std::set<std::string> g_uiMissing;
+
+    // Textos do jogo (thread do jogo)
+    int g_loaded = 0;
     std::unordered_map<std::string, std::u16string> g_text;
     std::unordered_map<std::string, uint32_t> g_block;      // chave -> traducao na memoria do jogo
     std::unordered_map<uint32_t, uint32_t> g_swapped;       // objeto -> ponteiro original
-    bool g_blocksReady = false;
-    std::atomic<bool> g_translate{false};
-    bool g_hasFixedLanguage = false; // RDR_LANG
+    std::set<std::string> g_missing;
     PS2Runtime::RecompiledFunction g_origTextLookup = nullptr;
     PS2Runtime::RecompiledFunction g_origTextDestroy = nullptr;
 
@@ -81,17 +108,26 @@ namespace
         return out;
     }
 
-    fs::path findLanguageFile(const std::string &lang)
+    // Texto dos menus do port: UTF-8, so os escapes simples
+    std::string unescapeUtf8(const std::string &s)
     {
-        const fs::path elfDir = PS2Runtime::getIoPaths().elfDirectory;
-        std::error_code ec;
-        for (const fs::path &dir : {elfDir.parent_path() / "text", elfDir / "text"})
-            if (fs::exists(dir / (lang + ".txt"), ec))
-                return dir / (lang + ".txt");
-        return {};
+        std::string out;
+        for (size_t i = 0; i < s.size(); ++i)
+        {
+            if (s[i] == '\\' && i + 1 < s.size() && (s[i + 1] == 'n' || s[i + 1] == 't' || s[i + 1] == '\\'))
+            {
+                out.push_back(s[i + 1] == 'n' ? '\n' : s[i + 1] == 't' ? '\t' : '\\');
+                ++i;
+            }
+            else
+                out.push_back(s[i]);
+        }
+        return out;
     }
 
-    void loadLanguage(const fs::path &file)
+    // Le o arquivo; text e ui podem ser nulos (so o nome)
+    void parseFile(const fs::path &file, std::string *name, std::unordered_map<std::string, std::u16string> *text,
+                   std::unordered_map<std::string, std::string> *ui)
     {
         std::ifstream in(file, std::ios::binary);
         std::string line;
@@ -103,12 +139,57 @@ namespace
             first = false;
             if (!line.empty() && line.back() == '\r')
                 line.pop_back();
+            if (line.rfind("@language ", 0) == 0)
+            {
+                if (name)
+                    *name = line.substr(10);
+                if (!text && !ui)
+                    return;
+                continue;
+            }
             const size_t tab = line.find('\t');
             if (line.empty() || line[0] == '#' || tab == std::string::npos || tab + 1 == line.size())
                 continue;
-            g_text[line.substr(0, tab)] = decodeLine(line.substr(tab + 1));
+            const std::string key = line.substr(0, tab), value = line.substr(tab + 1);
+            if (text)
+                (*text)[key] = decodeLine(value);
+            if (ui)
+                (*ui)[key] = unescapeUtf8(value);
         }
     }
+
+    std::string textUpper(std::string s)
+    {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        return s;
+    }
+
+    void scanLanguages()
+    {
+        g_languages.push_back({"EN", "English", {}});
+        const fs::path elfDir = PS2Runtime::getIoPaths().elfDirectory;
+        std::error_code ec;
+        for (const fs::path &dir : {elfDir.parent_path() / "text", elfDir / "text"})
+            for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
+            {
+                if (textUpper(it->path().extension().string()) != ".TXT")
+                    continue;
+                Language lang{textUpper(it->path().stem().string()), {}, it->path()};
+                if (std::any_of(g_languages.begin(), g_languages.end(), [&](const Language &l) { return l.id == lang.id; }))
+                    continue;
+                parseFile(lang.file, &lang.name, nullptr, nullptr);
+                if (lang.name.empty())
+                    lang.name = lang.id;
+                if (lang.id == "EN")
+                    g_languages[0] = lang; // um EN.txt pode trocar textos em ingles
+                else
+                    g_languages.push_back(lang);
+            }
+        const char *log = std::getenv("RDR_TEXT_LOG");
+        g_log = log && log[0] == '1';
+    }
+
+    void ensureScanned() { std::call_once(g_scanOnce, scanLanguages); }
 
     uint32_t read32(const uint8_t *rdram, uint32_t address)
     {
@@ -153,10 +234,21 @@ namespace
         return 0u;
     }
 
-    // Uma vez: copia as traducoes para o heap do runtime, que o jogo nao libera
-    void buildBlocks(uint8_t *rdram, PS2Runtime *runtime)
+    // Troca de idioma na thread do jogo: devolve os textos originais, libera os blocos e copia os do idioma novo para o
+    // heap do runtime (o jogo nao o usa nem libera)
+    void switchLanguage(uint8_t *rdram, PS2Runtime *runtime, int index)
     {
-        g_blocksReady = true;
+        for (const auto &[object, original] : g_swapped)
+            write32(rdram, object + 8u, original);
+        g_swapped.clear();
+        for (const auto &[key, block] : g_block)
+            runtime->guestFree(block);
+        g_block.clear();
+        g_text.clear();
+        g_loaded = index;
+        if (index <= 0 || index >= static_cast<int>(g_languages.size()) || g_languages[index].file.empty())
+            return;
+        parseFile(g_languages[index].file, nullptr, &g_text, nullptr);
         size_t used = 0u, skipped = 0u;
         for (const auto &[key, text] : g_text)
         {
@@ -171,35 +263,27 @@ namespace
             g_block[key] = block;
             used += bytes;
         }
-        std::fprintf(stderr, "[rdr] texto: %zu bytes na memoria do jogo, %zu sem espaco\n", used, skipped);
+        std::fprintf(stderr, "[rdr] texto: %s, %zu textos, %zu bytes na memoria do jogo, %zu sem espaco\n",
+                     g_languages[index].id.c_str(), g_text.size(), used, skipped);
     }
 
     void textLookup(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        if (!g_blocksReady)
-            buildBlocks(rdram, runtime);
+        const int wanted = g_wanted.load(std::memory_order_relaxed);
+        if (wanted != g_loaded)
+            switchLanguage(rdram, runtime, wanted);
         const uint32_t keyAddress = GPR_U32(ctx, 4);
-        if (keyAddress != 0u)
+        if (keyAddress != 0u && (!g_block.empty() || g_log))
         {
             const char *key = reinterpret_cast<const char *>(rdram + (keyAddress & kRamMask));
             const auto block = g_block.find(key);
+            if (block == g_block.end() && g_log && g_missing.insert(key).second)
+                std::fprintf(stderr, "[rdr] texto sem traducao: %s\n", key);
             const uint32_t object = block != g_block.end() ? findTextObject(rdram, keyHash(key)) : 0u;
-            if (object != 0u)
+            if (object != 0u && g_swapped.find(object) == g_swapped.end())
             {
-                const auto swapped = g_swapped.find(object);
-                if (g_translate.load(std::memory_order_relaxed))
-                {
-                    if (swapped == g_swapped.end())
-                    {
-                        g_swapped[object] = read32(rdram, object + 8u);
-                        write32(rdram, object + 8u, block->second);
-                    }
-                }
-                else if (swapped != g_swapped.end())
-                {
-                    write32(rdram, object + 8u, swapped->second);
-                    g_swapped.erase(swapped);
-                }
+                g_swapped[object] = read32(rdram, object + 8u);
+                write32(rdram, object + 8u, block->second);
             }
         }
         g_origTextLookup(rdram, ctx, runtime);
@@ -218,34 +302,86 @@ namespace
     }
 }
 
-bool rdrSystemLanguageIsPortuguese(); // rdr_win32.cpp
-
-// Ha traducao instalada? Sem ela o menu so oferece ingles.
-bool rdrTextHasPortuguese()
+int rdrTextLanguageCount()
 {
-    return !findLanguageFile("pt-br").empty();
+    ensureScanned();
+    return static_cast<int>(g_languages.size());
 }
 
-// 0 automatico, 1 ingles, 2 portugues. Vale nas proximas buscas: telas ja abertas mudam ao serem reabertas.
-void rdrTextSetLanguage(int choice)
+std::string rdrTextLanguageName(int index)
 {
-    if (!g_hasFixedLanguage)
-        g_translate.store(choice == 2 || (choice == 0 && rdrSystemLanguageIsPortuguese()), std::memory_order_relaxed);
+    ensureScanned();
+    return index >= 0 && index < static_cast<int>(g_languages.size()) ? g_languages[index].name : std::string();
+}
+
+std::string rdrTextLanguageId(int index)
+{
+    ensureScanned();
+    return index >= 0 && index < static_cast<int>(g_languages.size()) ? g_languages[index].id : std::string("EN");
+}
+
+// Indice do id (sem diferenciar maiusculas); -1 se nao houver
+int rdrTextLanguageIndex(const std::string &id)
+{
+    ensureScanned();
+    for (size_t i = 0; i < g_languages.size(); ++i)
+        if (g_languages[i].id == textUpper(id))
+            return static_cast<int>(i);
+    return -1;
+}
+
+// Sem escolha salva: o idioma do Windows ("pt-BR" acha PT-BR.txt; "pt-PT" tambem, pelo "PT"), senao ingles
+int rdrTextDefaultLanguage()
+{
+    ensureScanned();
+    const std::string locale = textUpper(rdrSystemLocaleName());
+    if (const int exact = rdrTextLanguageIndex(locale); exact >= 0)
+        return exact;
+    const std::string base = locale.substr(0, locale.find('-'));
+    for (size_t i = 1; i < g_languages.size(); ++i)
+        if (g_languages[i].id.substr(0, g_languages[i].id.find('-')) == base)
+            return static_cast<int>(i);
+    return 0;
+}
+
+// Vale nas proximas buscas: telas ja abertas mudam ao serem reabertas
+void rdrTextSetLanguage(int index)
+{
+    ensureScanned();
+    if (g_fixed || index < 0 || index >= static_cast<int>(g_languages.size()))
+        return;
+    std::unordered_map<std::string, std::string> ui;
+    if (!g_languages[index].file.empty())
+        parseFile(g_languages[index].file, nullptr, nullptr, &ui);
+    {
+        std::lock_guard<std::mutex> lock(g_uiMutex);
+        g_ui.swap(ui);
+    }
+    g_wanted.store(index, std::memory_order_relaxed);
+}
+
+// Menus do port: o texto em ingles e a chave
+std::string rdrTextTr(const std::string &english)
+{
+    std::lock_guard<std::mutex> lock(g_uiMutex);
+    const auto it = g_ui.find(english);
+    if (it != g_ui.end())
+        return it->second;
+    if (g_log && g_wanted.load(std::memory_order_relaxed) != 0 && g_uiMissing.insert(english).second)
+        std::fprintf(stderr, "[rdr] menu sem traducao: %s\n", english.c_str());
+    return english;
 }
 
 void rdrTextInstall(PS2Runtime &runtime)
 {
-    const fs::path file = findLanguageFile("pt-br");
-    if (file.empty())
-        return;
+    ensureScanned();
+    std::fprintf(stderr, "[rdr] texto: %zu idioma(s)\n", g_languages.size());
     if (const char *env = std::getenv("RDR_LANG"); env && env[0])
     {
-        g_hasFixedLanguage = true;
-        g_translate.store(std::strcmp(env, "pt-br") == 0, std::memory_order_relaxed);
+        rdrTextSetLanguage(std::max(0, rdrTextLanguageIndex(env)));
+        g_fixed = true;
     }
-    loadLanguage(file);
-    std::fprintf(stderr, "[rdr] texto: %zu traducoes em %s\n", g_text.size(), file.string().c_str());
-    if (g_text.empty())
+    if (g_languages.size() < 2u && !g_log)
         return;
     g_origTextLookup = runtime.lookupFunction(0x0017F398u);
     runtime.replaceFunction(0x0017F398u, textLookup);

@@ -81,14 +81,20 @@ std::filesystem::path rdrExeDirectory()
     return std::filesystem::current_path();
 }
 
-// Idioma da interface do Windows (pt-BR e pt-PT usam a mesma traducao)
-bool rdrSystemLanguageIsPortuguese()
+// Idioma da interface do Windows, no formato "pt-BR" (vazio se nao der para ler)
+std::string rdrSystemLocaleName()
 {
 #if defined(_WIN32)
-    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE;
-#else
-    return false;
+    wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+    if (LCIDToLocaleName(MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT), name, LOCALE_NAME_MAX_LENGTH, 0) > 0)
+    {
+        std::string out;
+        for (const wchar_t *c = name; *c; ++c)
+            out.push_back(static_cast<char>(*c));
+        return out;
+    }
 #endif
+    return {};
 }
 
 // Pasta Documentos do usuario (como o GTA Vice City: Documentos\<jogo>)

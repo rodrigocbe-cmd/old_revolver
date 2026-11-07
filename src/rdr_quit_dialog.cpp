@@ -185,11 +185,20 @@ namespace
         {
             float w = 0.0f;
             for (uint16_t c : text)
-                if (const Glyph *g = find(c))
+                if (const Glyph *g = findOrPlain(c))
                     w += (g->w + spacing) * scale;
                 else
                     w += spaceWidth * scale;
             return w;
+        }
+
+        // Fonte sem acentos (regulatorcondensed): a letra sem o acento
+        const Glyph *findOrPlain(uint16_t c) const
+        {
+            if (const Glyph *g = find(c))
+                return g;
+            static const char kPlain[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+            return c >= 0xC0u && c <= 0xFFu ? find(static_cast<uint8_t>(kPlain[c - 0xC0u])) : nullptr;
         }
 
         // Escreve a partir de x na linha de base y; icones (caracteres >= 0x80) sem a cor do texto.
@@ -197,7 +206,7 @@ namespace
         {
             for (uint16_t c : text)
             {
-                const Glyph *g = find(c);
+                const Glyph *g = findOrPlain(c);
                 if (!g)
                 {
                     x += spaceWidth * scale;
@@ -205,18 +214,28 @@ namespace
                 }
                 const Rectangle src{static_cast<float>(g->x), static_cast<float>(g->y), static_cast<float>(g->w), static_cast<float>(g->h)};
                 const Rectangle dst{x, y + g->yoff * scale, g->w * scale, g->h * scale};
-                const Color tint = c >= 0x80 ? Color{255, 255, 255, color.a} : color;
+                const Color tint = c >= 0x80 && c < 0xC0 ? Color{255, 255, 255, color.a} : color; // icones; acentos seguem a cor
                 DrawTexturePro(pages[g->page], src, dst, Vector2{0, 0}, 0.0f, tint);
                 x += (g->w + spacing) * scale;
             }
         }
     };
 
-    std::vector<uint16_t> chars(const char *s)
+    // UTF-8 vira os codigos das fontes do jogo (Latin-1); byte solto (icones 0x80..0xBF) passa como esta
+    std::vector<uint16_t> chars(const std::string &s)
     {
         std::vector<uint16_t> v;
-        for (; *s; ++s)
-            v.push_back(static_cast<uint8_t>(*s));
+        for (size_t i = 0; i < s.size(); ++i)
+        {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            if ((c & 0xE0u) == 0xC0u && i + 1 < s.size() && (static_cast<unsigned char>(s[i + 1]) & 0xC0u) == 0x80u)
+            {
+                v.push_back(static_cast<uint16_t>(((c & 0x1Fu) << 6) | (static_cast<unsigned char>(s[i + 1]) & 0x3Fu)));
+                ++i;
+            }
+            else
+                v.push_back(c);
+        }
         return v;
     }
 
@@ -254,6 +273,19 @@ namespace
     }
 }
 
+std::string rdrTextTr(const std::string &english); // rdr_text.cpp
+
+// Cartao dos popups do jogo: preto translucido (como o aviso de jogo novo do livro) com o ornamento de cima do
+// silentfilmpopup.tex. Pixels da janela.
+void rdrUiDrawCard(float x, float y, float w, float h)
+{
+    if (!loadAssets())
+        return;
+    DrawRectangleRec(Rectangle{x, y, w, h}, Color{16, 13, 11, 205});
+    const float k = w / 512.0f;
+    DrawTexturePro(g_assets.paper, Rectangle{0, 0, 512, 48}, Rectangle{x, y + 14 * k, w, 48 * k}, Vector2{0, 0}, 0.0f, WHITE);
+}
+
 // Coordenadas da tela do jogo (640x448) convertidas para a area da imagem na janela. Layout do popup do proprio
 // jogo ao sair de uma fase, com o texto "Quit the game?": cartao preto com o ornamento do
 // silentfilmpopup.tex, texto branco na berrylium e YES/NO na regulatorcondensed (selecionado branco, outro cinza).
@@ -270,16 +302,10 @@ bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4])
         return g && g->h > 0 ? height * s / g->h : s;
     };
 
-    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Fade(BLACK, 0.35f));
-    const Rectangle card{X(161), Y(113), 320 * sx, 224 * sy};
-    DrawRectangleRec(card, BLACK);
-    // so o ornamento de cima da textura (a de baixo nao aparece no popup do jogo)
-    const float k = card.width / 512.0f;
-    DrawTexturePro(g_assets.paper, Rectangle{0, 0, 512, 48}, Rectangle{card.x, card.y + 14 * k, card.width, 48 * k},
-                   Vector2{0, 0}, 0.0f, WHITE);
+    rdrUiDrawCard(X(161), Y(113), 320 * sx, 224 * sy);
 
     const Color white{235, 235, 230, 255}, gray{128, 128, 128, 255};
-    const std::vector<uint16_t> title = chars("Quit the game?");
+    const std::vector<uint16_t> title = chars(rdrTextTr("Quit the game?"));
     const float bs = fit(g_assets.prompt, 'Q', 20.0f);
     g_assets.prompt.draw(title, X(320) - g_assets.prompt.width(title, bs) / 2.0f, Y(222), bs, white);
 
@@ -287,7 +313,7 @@ bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4])
     const float is = fit(g_assets.title, 'E', 38.0f);
     for (int i = 0; i < 2; ++i)
     {
-        const std::vector<uint16_t> t = chars(kItems[i]);
+        const std::vector<uint16_t> t = chars(rdrTextTr(kItems[i]));
         const float w = g_assets.title.width(t, is);
         const float cx = X(i == 0 ? 268.0f : 384.0f);
         g_assets.title.draw(t, cx - w / 2.0f, Y(302), is, i == selected ? white : gray);
@@ -316,11 +342,11 @@ float rdrUiScaleFor(int font, char ref, float pixelHeight)
 float rdrUiTextWidth(int font, const std::string &text, float scale)
 {
     const auto &f = font == 0 ? g_assets.title : g_assets.prompt;
-    return f.width(chars(text.c_str()), scale);
+    return f.width(chars(rdrTextTr(text)), scale);
 }
 
 void rdrUiDrawText(int font, const std::string &text, float x, float baseline, float scale, Color color)
 {
     const auto &f = font == 0 ? g_assets.title : g_assets.prompt;
-    f.draw(chars(text.c_str()), x, baseline, scale, color);
+    f.draw(chars(rdrTextTr(text)), x, baseline, scale, color);
 }

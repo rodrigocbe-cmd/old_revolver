@@ -31,13 +31,13 @@ Para as fontes sem acento há duas saídas: desenhar os glifos nas páginas `.te
 
 Troca feita na busca por chave, sem reescrever os `.strtbl` (`src/rdr_text.cpp`). Confirmado: `FUN_0017F398(chave)` é a única entrada para `FUN_0017BF38` e devolve o objeto de texto, com a cadeia UTF-16 em `+8`, alocada por `FUN_00219E70` e liberada por `FUN_00219F70` no destrutor `FUN_0017B980`. O override procura a chave em `text/pt-br.txt` e troca a cadeia no objeto, então o tamanho do texto pode mudar e o arquivo do jogo fica intacto. O hash da chave diferencia maiúsculas de minúsculas. Cada entrada do `.strtbl` também traz fonte e escala, ainda não usadas. O arquivo tem lugar para 10 idiomas; só o primeiro está preenchido.
 
-Um arquivo por idioma na pasta `text/`, como o GTA VC. O jogo inicia no idioma do Windows e cai para inglês se não houver tradução. Interface Options > Language troca entre Auto, English e Portuguese; a opção Portuguese só aparece se `text/pt-br.txt` existir. `RDR_LANG=en|pt-br` fixa o idioma nos testes.
+Um arquivo por idioma na pasta `text/`, como o GTA VC. Cada idioma é um arquivo em `text/` (ex.: `PT-BR.txt`), lido ao iniciar. A primeira linha `@language Nome` dá o nome mostrado no menu; o id é o nome do arquivo. O mesmo arquivo traduz os menus do PC (PC Settings, caixa de saída, aviso de conquistas), com o texto em inglês como chave. Interface Options > Language lista English e os arquivos achados; na primeira vez o jogo escolhe pelo idioma do Windows (ou inglês) e grava `language = <id>` no settings.ini. `RDR_LANG=<id>` fixa o idioma; `RDR_TEXT_LOG=1` registra as chaves sem tradução. Fontes de título (regulatorcondensed, bosshealth, damaged, woodcut, narrow) não têm acentos: nos menus do PC a letra acentuada vira a letra sem acento; nos textos do jogo, escrever sem acento.
 
 ## Etapas
 
 1. **Extrator (pronto):** `python tools/text_extract.py game/disc out/text/en.txt`.
 2. **Motor (pronto):** frases de teste vistas na tela de perfil, com ç e ã. Texto longo passou da borda do papel em "Change Name".
-3. **Tradução dos menus:** `.strtbl` e `.swui`.
+3. **Tradução dos menus (feito para o menu inicial, 2026-11-07):** 241 textos em `PT-BR.txt` (escritório, livro, perfis, opções do jogo, trapaças, recompensas, Showdown, PC Settings). Faltam: "Press START button" (Flash), "New Player" (chave não achada), títulos em imagem.
 4. **Tradução da história e das dicas:** o maior volume. Glifos de botão (`0xBA`...) precisam ficar no texto.
 5. **Fontes:** acentos nas fontes de título.
 6. **Flash e imagens:** telas de `.pck` e texturas com texto.

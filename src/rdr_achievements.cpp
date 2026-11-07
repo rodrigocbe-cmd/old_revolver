@@ -155,22 +155,26 @@ void rdrAchievementsRecheckProfile()
     g_recheckProfile.store(true, std::memory_order_relaxed);
 }
 
-// Thread da janela: aviso de 6 s no canto superior, por cima do jogo
+bool rdrUiReady();                                                                // rdr_quit_dialog.cpp
+float rdrUiScaleFor(int font, char ref, float pixelHeight);                       // rdr_quit_dialog.cpp
+float rdrUiTextWidth(int font, const std::string &text, float scale);             // rdr_quit_dialog.cpp
+void rdrUiDrawText(int font, const std::string &text, float x, float baseline, float scale, Color color);
+void rdrUiDrawCard(float x, float y, float w, float h);                           // rdr_quit_dialog.cpp
+
+// Thread da janela: aviso de 6 s no canto superior direito, no estilo da caixa de saida, pequeno
 void rdrAchievementsOverlay()
 {
-    if (nowMs() >= g_toastUntilMs.load(std::memory_order_relaxed))
+    if (nowMs() >= g_toastUntilMs.load(std::memory_order_relaxed) || !rdrUiReady())
         return;
-    const float s = GetScreenHeight() / 1080.0f;
-    const char *title = "Achievements disabled";
-    const char *line = "This profile has used cheats.";
-    const int titleSize = static_cast<int>(34 * s), lineSize = static_cast<int>(24 * s);
-    const int width = std::max(MeasureText(title, titleSize), MeasureText(line, lineSize)) + static_cast<int>(48 * s);
-    const int height = static_cast<int>(92 * s);
-    const int x = (GetScreenWidth() - width) / 2, y = static_cast<int>(36 * s);
-    DrawRectangle(x, y, width, height, {12, 8, 6, 225});
-    DrawRectangleLines(x, y, width, height, {214, 170, 96, 255});
-    DrawText(title, x + static_cast<int>(24 * s), y + static_cast<int>(14 * s), titleSize, {214, 170, 96, 255});
-    DrawText(line, x + static_cast<int>(24 * s), y + static_cast<int>(54 * s), lineSize, {232, 232, 228, 255});
+    const float h = GetScreenHeight() / 1080.0f;
+    const std::string title = "Achievements disabled", line = "This profile has used cheats.";
+    const float titleScale = rdrUiScaleFor(1, 'B', 26 * h), lineScale = rdrUiScaleFor(1, 'B', 19 * h);
+    const float width = std::max(rdrUiTextWidth(1, title, titleScale), rdrUiTextWidth(1, line, lineScale)) + 56 * h;
+    const float height = 132 * h, x = GetScreenWidth() - width - 28 * h, y = 28 * h;
+    rdrUiDrawCard(x, y, width, height);
+    const Color white{235, 235, 230, 255}, gray{190, 186, 178, 255};
+    rdrUiDrawText(1, title, x + (width - rdrUiTextWidth(1, title, titleScale)) / 2.0f, y + 78 * h, titleScale, white);
+    rdrUiDrawText(1, line, x + (width - rdrUiTextWidth(1, line, lineScale)) / 2.0f, y + 112 * h, lineScale, gray);
 }
 
 // Jogo, a cada quadro: confere o perfil na RAM a cada ~10 s

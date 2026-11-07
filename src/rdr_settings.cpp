@@ -44,8 +44,12 @@ void rdrWin32ApplyWindowMode(void *window, bool fullscreen, int width, int heigh
 void rdrMenuButtonsPump();                                                        // rdr_overrides.cpp
 void rdrAchievementsPump(uint8_t *rdram);                                          // rdr_achievements.cpp
 void rdrFmvOverlay();                                                             // rdr_fmv.cpp
-bool rdrTextHasPortuguese();                                                      // rdr_text.cpp
-void rdrTextSetLanguage(int choice);                                              // rdr_text.cpp
+int rdrTextLanguageCount();                                                       // rdr_text.cpp
+std::string rdrTextLanguageName(int index);                                       // rdr_text.cpp
+std::string rdrTextLanguageId(int index);                                         // rdr_text.cpp
+int rdrTextLanguageIndex(const std::string &id);                                  // rdr_text.cpp
+int rdrTextDefaultLanguage();                                                     // rdr_text.cpp
+void rdrTextSetLanguage(int index);                                               // rdr_text.cpp
 void rdrAchievementsOverlay();                                                    // rdr_achievements.cpp
 void rdrTitleLogoPump(uint8_t *rdram);                                            // rdr_overrides.cpp
 bool rdrControlsSave();                                                           // rdr_controls.cpp
@@ -68,7 +72,7 @@ namespace
         int mouseSens = 6;   // 1..20 (unidades do analogico por pixel)
         int invertY = 0;
         int walkSpeed = 9;   // 0..9 -> walk_tilt 0,40..0,76 (docs/CONTROLES.md)
-        int language = 0;    // 0 automatico (sistema), 1 ingles, 2 portugues
+        int language = 0;    // indice em rdrTextLanguage*; no settings.ini vai o id (EN, PT-BR...)
         // Opcoes do jogo (nao vao ao settings.ini: o jogo as salva no perfil; lidas ao abrir o menu)
         int brightness = 10; // 0..20: fracao do slider original
         int posX = 25;       // 0..50
@@ -108,7 +112,17 @@ namespace
         {"hd_textures", &StSettings::hdTextures, 0, 1}, {"hires_output", &StSettings::hiresOutput, 0, 1},
         {"image_filter", &StSettings::filter, 0, 1},    {"master_volume", &StSettings::volume, 0, 10},
         {"mouse_sensitivity", &StSettings::mouseSens, 1, 20}, {"invert_mouse_y", &StSettings::invertY, 0, 1},
-        {"walk_speed", &StSettings::walkSpeed, 0, 9},   {"language", &StSettings::language, 0, 2}};
+        {"walk_speed", &StSettings::walkSpeed, 0, 9}};
+
+    std::string g_languageId; // como veio do settings.ini; vazio = ainda nao escolhido (usa o do Windows)
+
+    // Indice do idioma: o salvo, senao o do Windows. Valores 0/1/2 sao da versao com "Auto".
+    void stResolveLanguage()
+    {
+        const std::string id = g_languageId == "1" ? "EN" : g_languageId == "2" ? "PT-BR" : g_languageId;
+        const int index = id.empty() || id == "0" ? -1 : rdrTextLanguageIndex(id);
+        g_st.language = index >= 0 ? index : rdrTextDefaultLanguage();
+    }
 
     void stLoad()
     {
@@ -122,6 +136,11 @@ namespace
             std::string key = line.substr(0, eq);
             key.erase(std::remove_if(key.begin(), key.end(), ::isspace), key.end());
             const int value = std::atoi(line.c_str() + eq + 1);
+            if (key == "language")
+            {
+                g_languageId = line.substr(eq + 1);
+                g_languageId.erase(std::remove_if(g_languageId.begin(), g_languageId.end(), ::isspace), g_languageId.end());
+            }
             for (const StKey &k : kStKeys)
                 if (key == k.name)
                     g_st.*k.field = std::clamp(value, k.lo, k.hi);
@@ -140,6 +159,7 @@ namespace
                "; image_filter 0 smooth 1 sharp | master_volume 0-10 | mouse_sensitivity 1-20 | walk_speed 0-9\r\n\r\n";
         for (const StKey &k : kStKeys)
             out << k.name << " = " << g_st.*k.field << "\r\n";
+        out << "language = " << rdrTextLanguageId(g_st.language) << "\r\n";
         return static_cast<bool>(out);
     }
 
@@ -384,9 +404,13 @@ namespace
         pages.push_back({"Interface Options",
                          {{"Subtitles", "Shows the dialogue as text.", offOn, &StSettings::subtitles},
                           {"HUD Size", "Makes the game menus and HUD smaller on large screens.", {}, nullptr, 0, false, true},
-                          {"Language", "Language of the game text. Auto follows Windows, or English if there is no translation. Open menus change when reopened.",
-                           rdrTextHasPortuguese() ? std::vector<std::string>{"Auto", "English", "Portuguese"}
-                                                  : std::vector<std::string>{"Auto", "English"},
+                          {"Language", "Language of the game text and menus. Files in the text folder add languages. Open menus change when reopened.",
+                           [] {
+                               std::vector<std::string> names;
+                               for (int i = 0; i < rdrTextLanguageCount(); ++i)
+                                   names.push_back(rdrTextLanguageName(i));
+                               return names;
+                           }(),
                            &StSettings::language}}});
         pages[4].items[2].onChange = [] { rdrTextSetLanguage(g_st.language); };
         pages[3].items[2].onChange = [] {
@@ -702,8 +726,7 @@ void rdrSettingsApplyAtBoot()
 void rdrSettingsInstall(PS2Runtime &runtime)
 {
     stLoad();
-    if (g_st.language == 2 && !rdrTextHasPortuguese())
-        g_st.language = 0;
+    stResolveLanguage();
     rdrTextSetLanguage(g_st.language);
     g_origFramePump = runtime.lookupFunction(0x0025F960u);
     runtime.replaceFunction(0x0025F960u, stFramePump);

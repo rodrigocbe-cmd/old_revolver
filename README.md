@@ -21,7 +21,7 @@ The MIPS R5900 code in the game's executable is translated **ahead of time** int
 
 Known issues and the current investigation are tracked in [docs/ESTADO.md](docs/ESTADO.md). The docs are in Portuguese.
 
-## PC version features (v0.1.0)
+## PC version features (v1.0.0)
 
 - **Launcher** (`RDR Launcher.exe`) styled after the game. You pick your own ISO once, and the game files are installed into folders by type (`movies\`, `audio\`, `levels\`, …). The layout is modeled on the classic PC releases.
 - **Direct game executable** (`RedDeadRevolver.exe`). It starts the game at native resolution, fullscreen and widescreen.

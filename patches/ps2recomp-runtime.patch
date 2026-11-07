@@ -2692,10 +2692,10 @@ index 0000000..98ecb0d
 +
 +#endif // PS2_MPEG_OPTIONS_H
 diff --git a/ps2xRuntime/include/runtime/ps2_pad.h b/ps2xRuntime/include/runtime/ps2_pad.h
-index 7755fe6..7b60e35 100644
+index 7755fe6..51cc8d9 100644
 --- a/ps2xRuntime/include/runtime/ps2_pad.h
 +++ b/ps2xRuntime/include/runtime/ps2_pad.h
-@@ -4,6 +4,44 @@
+@@ -4,6 +4,46 @@
  #include <cstddef>
  #include <cstdint>
  
@@ -2729,6 +2729,8 @@ index 7755fe6..7b60e35 100644
 +Ps2PadKeyMap ps2PadDefaultKeyMap();
 +void ps2PadSetKeyMap(const Ps2PadKeyMap &map);
 +Ps2PadKeyMap ps2PadGetKeyMap();
++// Enquanto ativo, triangulo, circulo e xis usam estas teclas e elas deixam os outros botoes (ps2PadGetKeyMap ja devolve assim)
++void ps2PadSetMenuKeys(bool active, int triangle, int circle, int cross);
 +// Mouse: unidades do analogico direito por pixel (padrao 6, PS2X_MOUSE_SENS) e eixo vertical invertido
 +void ps2PadSetMouseTuning(float sensitivity, bool invertY);
 +void ps2PadGetMouseTuning(float &sensitivity, bool &invertY);
@@ -6939,7 +6941,7 @@ index 37b6a4d..d083c89 100644
 +    }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_pad.cpp b/ps2xRuntime/src/lib/ps2_pad.cpp
-index 8590f14..8208bee 100644
+index 8590f14..c411c59 100644
 --- a/ps2xRuntime/src/lib/ps2_pad.cpp
 +++ b/ps2xRuntime/src/lib/ps2_pad.cpp
 @@ -1,6 +1,14 @@
@@ -6957,7 +6959,7 @@ index 8590f14..8208bee 100644
  
  namespace
  {
-@@ -23,6 +31,228 @@ namespace
+@@ -23,6 +31,253 @@ namespace
      constexpr uint16_t PAD_L1 = 0x0400u;
      constexpr uint16_t PAD_R2 = 0x0200u;
      constexpr uint16_t PAD_L2 = 0x0100u;
@@ -7005,6 +7007,8 @@ index 8590f14..8208bee 100644
 +    } g_mouse;
 +
 +    std::mutex g_keyMapMutex;
++    bool g_menuKeysActive = false;
++    int g_menuKeys[3] = {}; // triangulo, circulo, xis
 +
 +    bool inputDown(int input, uint8_t mouseDown)
 +    {
@@ -7118,7 +7122,30 @@ index 8590f14..8208bee 100644
 +Ps2PadKeyMap ps2PadGetKeyMap()
 +{
 +    std::lock_guard<std::mutex> lock(g_keyMapMutex);
-+    return keyMap();
++    Ps2PadKeyMap map = keyMap();
++    if (!g_menuKeysActive)
++        return map;
++    // Teclas proprias do menu inicial: saem de qualquer outro botao para nao apertar dois de uma vez
++    for (auto &slots : map.buttons)
++        for (int &in : slots)
++            for (const int menuKey : g_menuKeys)
++                if (in == menuKey)
++                    in = 0;
++    for (int i = 0; i < 3; ++i)
++    {
++        map.buttons[12 + i][0] = g_menuKeys[i];
++        map.buttons[12 + i][1] = map.buttons[12 + i][2] = 0;
++    }
++    return map;
++}
++
++void ps2PadSetMenuKeys(bool active, int triangle, int circle, int cross)
++{
++    std::lock_guard<std::mutex> lock(g_keyMapMutex);
++    g_menuKeysActive = active;
++    g_menuKeys[0] = triangle;
++    g_menuKeys[1] = circle;
++    g_menuKeys[2] = cross;
 +}
 +
 +// Menu do port aberto (ps2_runtime.cpp, FUNCOES.md #66): o jogo ve o controle em repouso e o mouse e solto.
@@ -7186,7 +7213,7 @@ index 8590f14..8208bee 100644
  }
  
  bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
-@@ -36,6 +266,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -36,6 +291,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
      data[2] = 0xFF;
      data[3] = 0xFF;
      data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
@@ -7195,7 +7222,7 @@ index 8590f14..8208bee 100644
  
      uint16_t btns = 0xFFFFu;
      constexpr int kGamepad = 0;
-@@ -87,38 +319,58 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
+@@ -87,38 +344,58 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
          data[4] = static_cast<uint8_t>(128 + rx * 127);
          data[5] = static_cast<uint8_t>(128 + ry * 127);
      }

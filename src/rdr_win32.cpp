@@ -81,6 +81,16 @@ std::filesystem::path rdrExeDirectory()
     return std::filesystem::current_path();
 }
 
+// Idioma da interface do Windows (pt-BR e pt-PT usam a mesma traducao)
+bool rdrSystemLanguageIsPortuguese()
+{
+#if defined(_WIN32)
+    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE;
+#else
+    return false;
+#endif
+}
+
 // Pasta Documentos do usuario (como o GTA Vice City: Documentos\<jogo>)
 std::filesystem::path rdrDocumentsDirectory()
 {

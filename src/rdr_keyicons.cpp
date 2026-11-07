@@ -28,6 +28,7 @@ namespace fs = std::filesystem;
 
 std::string rdrKeyName(int code);       // rdr_controls.cpp
 int rdrControlsPrimaryForPadBit(int bit); // rdr_controls.cpp (0 = sem tecla)
+int rdrControlsMenuKeyForPadBit(int bit); // rdr_controls.cpp (teclas do menu inicial)
 // gs_parallel_bridge.cpp
 void ps2GsRegisterHdTexture(uint64_t key, uint32_t w, uint32_t h, std::vector<uint8_t> rgba);
 uint64_t ps2GsHistogramKey(const uint32_t *histogram, bool eightBit);
@@ -56,6 +57,12 @@ namespace
         std::vector<uint8_t> patched; // gerada no primeiro uso
         bool built = false;
     };
+
+    // FRONT.DAT e o menu inicial, com teclas proprias; as fases usam as paginas do proprio .DAT
+    int pageKey(const IconPage &p, int bit)
+    {
+        return p.dat.filename() == "FRONT.DAT" ? rdrControlsMenuKeyForPadBit(bit) : rdrControlsPrimaryForPadBit(bit);
+    }
 
     std::mutex g_mutex;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, IconPage> g_pages; // (offset, tamanho, comprimido)
@@ -498,7 +505,7 @@ namespace
             d[3] = kind == 0 ? 0 : 128;
         };
         for (const GlyphRect &r : p.glyphs)
-            if (const int code = rdrControlsPrimaryForPadBit(r.padBit); code != 0)
+            if (const int code = pageKey(p, r.padBit); code != 0)
                 keyCapShape(put, {r.padBit, r.x * kHdFactor, r.y * kHdFactor, r.w * kHdFactor, r.h * kHdFactor}, keyLabel(code), 0, 1, 2);
         ps2GsRegisterHdTexture(ps2GsHistogramKey(histogram.data(), eight), static_cast<uint32_t>(W), static_cast<uint32_t>(H), std::move(rgba));
     }
@@ -514,7 +521,7 @@ namespace
             return;
         }
         for (const GlyphRect &r : p.glyphs)
-            if (const int code = rdrControlsPrimaryForPadBit(r.padBit); code != 0)
+            if (const int code = pageKey(p, r.padBit); code != 0)
                 drawKeyCap(p.patched, r, keyLabel(code));
         registerHdPage(p);
         // RDR_DUMP_ICONS=<pasta>: grava a pagina corrigida em PNG (conferencia sem rodar ate a tela)

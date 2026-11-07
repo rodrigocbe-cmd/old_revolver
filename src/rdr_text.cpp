@@ -1,13 +1,20 @@
 // Traducao (docs/TRADUCAO.md, FUNCOES.md #108): textos por chave em text/<idioma>.txt, sem alterar os .strtbl do jogo.
 // Formato do arquivo: UTF-8, uma linha "chave<TAB>texto", # comenta, escapes \n, \t, \\ e \uXXXX; texto vazio mantem o
-// original. tools/text_extract.py gera a base em ingles. RDR_LANG escolhe o idioma (padrao pt-br); sem arquivo, nada muda.
+// original. tools/text_extract.py gera a base em ingles. Por enquanto ha ingles (o texto do jogo) e portugues.
+// Idioma: opcao Language do PC Settings; em Auto, o do sistema, com ingles se nao houver arquivo. RDR_LANG=en|pt-br fixa.
 //
 // FUN_0017F398(chave) e a unica entrada para FUN_0017BF38 e devolve o objeto de texto, com a cadeia UTF-16 em +8, alocada
-// por FUN_00219E70 e liberada por FUN_00219F70 no destrutor FUN_0017B980. A troca e feita no proprio objeto.
+// por FUN_00219E70 e liberada no destrutor FUN_0017B980. A troca aponta +8 para um bloco nosso, e o destrutor recebe o
+// ponteiro original de volta.
+//
+// Estes ganchos nao chamam funcoes do jogo depois de comecar, nem fazem nada depois da funcao original: o escalonador pode
+// interromper o codigo gerado, e a funcao "volta" antes de terminar (FUNCOES.md #96). Por isso a busca e refeita aqui, so
+// lendo a memoria, antes de seguir para o original. A primeira versao chamava malloc e free e corrompia a thread.
 #include "game_overrides.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,9 +32,13 @@ namespace
     constexpr uint32_t kRamMask = 0x1FFFFFFu;
 
     std::unordered_map<std::string, std::u16string> g_text;
+    std::unordered_map<std::string, uint32_t> g_block;      // chave -> traducao na memoria do jogo
+    std::unordered_map<uint32_t, uint32_t> g_swapped;       // objeto -> ponteiro original
+    bool g_blocksReady = false;
+    std::atomic<bool> g_translate{false};
+    bool g_hasFixedLanguage = false; // RDR_LANG
     PS2Runtime::RecompiledFunction g_origTextLookup = nullptr;
-    PS2Runtime::RecompiledFunction g_alloc = nullptr;
-    PS2Runtime::RecompiledFunction g_free = nullptr;
+    PS2Runtime::RecompiledFunction g_origTextDestroy = nullptr;
 
     void appendUtf16(std::u16string &out, uint32_t cp)
     {
@@ -99,70 +110,145 @@ namespace
         }
     }
 
-    bool sameText(const uint8_t *rdram, uint32_t guest, const std::u16string &text)
+    uint32_t read32(const uint8_t *rdram, uint32_t address)
     {
-        if (guest == 0u)
-            return false;
-        const size_t bytes = (text.size() + 1u) * 2u;
-        if ((guest & kRamMask) + bytes > (kRamMask + 1u))
-            return false;
-        return std::memcmp(rdram + (guest & kRamMask), text.c_str(), bytes) == 0;
+        uint32_t value = 0u;
+        std::memcpy(&value, rdram + (address & kRamMask), 4);
+        return value;
+    }
+
+    void write32(uint8_t *rdram, uint32_t address, uint32_t value)
+    {
+        std::memcpy(rdram + (address & kRamMask), &value, 4);
+    }
+
+    // FUN_0017C1C8
+    uint32_t keyHash(const char *key)
+    {
+        uint32_t h = 0u;
+        for (; *key; ++key)
+        {
+            h = (h << 4) + static_cast<uint32_t>(static_cast<int32_t>(static_cast<signed char>(*key)));
+            const uint32_t top = h & 0xF0000000u;
+            if (top != 0u)
+                h ^= (top >> 24) ^ top;
+        }
+        return h;
+    }
+
+    // FUN_0017F398 + FUN_0017C690, so lendo: tabelas na mesma ordem, primeira que tiver a chave
+    uint32_t findTextObject(const uint8_t *rdram, uint32_t hash)
+    {
+        for (const uint32_t slot : {0x004F786Cu, 0x004F7870u, 0x004F7868u, 0x004F7864u})
+        {
+            const uint32_t table = read32(rdram, slot);
+            const uint32_t map = table != 0u ? read32(rdram, table) : 0u;
+            const uint32_t size = map != 0u ? read32(rdram, map) : 0u;
+            if (size == 0u)
+                continue;
+            for (uint32_t node = read32(rdram, read32(rdram, map + 4u) + (hash % size) * 4u); node != 0u; node = read32(rdram, node + 8u))
+                if (read32(rdram, node) == hash)
+                    return read32(rdram, node + 4u);
+        }
+        return 0u;
+    }
+
+    // Uma vez: copia as traducoes para o heap do runtime, que o jogo nao libera
+    void buildBlocks(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        g_blocksReady = true;
+        size_t used = 0u, skipped = 0u;
+        for (const auto &[key, text] : g_text)
+        {
+            const uint32_t bytes = static_cast<uint32_t>((text.size() + 1u) * 2u);
+            const uint32_t block = runtime->guestMalloc(bytes, 4u);
+            if (block == 0u)
+            {
+                ++skipped;
+                continue;
+            }
+            std::memcpy(rdram + (block & kRamMask), text.c_str(), bytes);
+            g_block[key] = block;
+            used += bytes;
+        }
+        std::fprintf(stderr, "[rdr] texto: %zu bytes na memoria do jogo, %zu sem espaco\n", used, skipped);
     }
 
     void textLookup(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        const uint32_t keyAddr = GPR_U32(ctx, 4);
-        std::string key;
-        if (keyAddr != 0u)
-            key = reinterpret_cast<const char *>(rdram + (keyAddr & kRamMask));
-
-        g_origTextLookup(rdram, ctx, runtime);
-
-        const uint32_t object = GPR_U32(ctx, 2);
-        const auto it = g_text.find(key);
-        if (object == 0u || it == g_text.end())
-            return;
-        uint32_t current = 0;
-        std::memcpy(&current, rdram + ((object + 8u) & kRamMask), 4);
-        const std::u16string &text = it->second;
-        // A comparacao, e nao um registro do que ja foi trocado, cobre objetos recriados ao trocar de fase
-        if (sameText(rdram, current, text))
-            return;
-
-        const uint32_t ra = GPR_U32(ctx, 31);
-        SET_GPR_U32(ctx, 4, static_cast<uint32_t>((text.size() + 1u) * 2u));
-        g_alloc(rdram, ctx, runtime);
-        const uint32_t block = GPR_U32(ctx, 2);
-        if (block != 0u)
+        if (!g_blocksReady)
+            buildBlocks(rdram, runtime);
+        const uint32_t keyAddress = GPR_U32(ctx, 4);
+        if (keyAddress != 0u)
         {
-            std::memcpy(rdram + (block & kRamMask), text.c_str(), (text.size() + 1u) * 2u);
-            std::memcpy(rdram + ((object + 8u) & kRamMask), &block, 4);
-            if (current != 0u)
+            const char *key = reinterpret_cast<const char *>(rdram + (keyAddress & kRamMask));
+            const auto block = g_block.find(key);
+            const uint32_t object = block != g_block.end() ? findTextObject(rdram, keyHash(key)) : 0u;
+            if (object != 0u)
             {
-                SET_GPR_U32(ctx, 4, current);
-                SET_GPR_U32(ctx, 31, ra);
-                g_free(rdram, ctx, runtime);
+                const auto swapped = g_swapped.find(object);
+                if (g_translate.load(std::memory_order_relaxed))
+                {
+                    if (swapped == g_swapped.end())
+                    {
+                        g_swapped[object] = read32(rdram, object + 8u);
+                        write32(rdram, object + 8u, block->second);
+                    }
+                }
+                else if (swapped != g_swapped.end())
+                {
+                    write32(rdram, object + 8u, swapped->second);
+                    g_swapped.erase(swapped);
+                }
             }
         }
-        SET_GPR_U32(ctx, 31, ra);
-        SET_GPR_U32(ctx, 2, object);
-        ctx->pc = ra;
+        g_origTextLookup(rdram, ctx, runtime);
     }
+
+    // FUN_0017B980: o jogo libera o que alocou, nunca o nosso bloco
+    void textDestroy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t object = GPR_U32(ctx, 4);
+        if (const auto swapped = g_swapped.find(object); swapped != g_swapped.end())
+        {
+            write32(rdram, object + 8u, swapped->second);
+            g_swapped.erase(swapped);
+        }
+        g_origTextDestroy(rdram, ctx, runtime);
+    }
+}
+
+bool rdrSystemLanguageIsPortuguese(); // rdr_win32.cpp
+
+// Ha traducao instalada? Sem ela o menu so oferece ingles.
+bool rdrTextHasPortuguese()
+{
+    return !findLanguageFile("pt-br").empty();
+}
+
+// 0 automatico, 1 ingles, 2 portugues. Vale nas proximas buscas: telas ja abertas mudam ao serem reabertas.
+void rdrTextSetLanguage(int choice)
+{
+    if (!g_hasFixedLanguage)
+        g_translate.store(choice == 2 || (choice == 0 && rdrSystemLanguageIsPortuguese()), std::memory_order_relaxed);
 }
 
 void rdrTextInstall(PS2Runtime &runtime)
 {
-    const char *env = std::getenv("RDR_LANG");
-    const std::string lang = env && env[0] ? env : "pt-br";
-    const fs::path file = findLanguageFile(lang);
+    const fs::path file = findLanguageFile("pt-br");
     if (file.empty())
         return;
+    if (const char *env = std::getenv("RDR_LANG"); env && env[0])
+    {
+        g_hasFixedLanguage = true;
+        g_translate.store(std::strcmp(env, "pt-br") == 0, std::memory_order_relaxed);
+    }
     loadLanguage(file);
     std::fprintf(stderr, "[rdr] texto: %zu traducoes em %s\n", g_text.size(), file.string().c_str());
     if (g_text.empty())
         return;
-    g_alloc = runtime.lookupFunction(0x00219E70u);
-    g_free = runtime.lookupFunction(0x00219F70u);
     g_origTextLookup = runtime.lookupFunction(0x0017F398u);
     runtime.replaceFunction(0x0017F398u, textLookup);
+    g_origTextDestroy = runtime.lookupFunction(0x0017B980u);
+    runtime.replaceFunction(0x0017B980u, textDestroy);
 }

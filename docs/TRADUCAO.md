@@ -31,7 +31,7 @@ Para as fontes sem acento há duas saídas: desenhar os glifos nas páginas `.te
 
 Troca feita na busca por chave, sem reescrever os `.strtbl` (`src/rdr_text.cpp`). Confirmado: `FUN_0017F398(chave)` é a única entrada para `FUN_0017BF38` e devolve o objeto de texto, com a cadeia UTF-16 em `+8`, alocada por `FUN_00219E70` e liberada por `FUN_00219F70` no destrutor `FUN_0017B980`. O override procura a chave em `text/pt-br.txt` e troca a cadeia no objeto, então o tamanho do texto pode mudar e o arquivo do jogo fica intacto. O hash da chave diferencia maiúsculas de minúsculas. Cada entrada do `.strtbl` também traz fonte e escala, ainda não usadas. O arquivo tem lugar para 10 idiomas; só o primeiro está preenchido.
 
-Um arquivo por idioma na pasta `text/`, como o GTA VC. `RDR_LANG` escolhe o idioma (padrão `pt-br`; sem arquivo, fica o original). O menu PC Settings ganhará a opção com inglês e português.
+Um arquivo por idioma na pasta `text/`, como o GTA VC. O jogo inicia no idioma do Windows e cai para inglês se não houver tradução. Interface Options > Language troca entre Auto, English e Portuguese; a opção Portuguese só aparece se `text/pt-br.txt` existir. `RDR_LANG=en|pt-br` fixa o idioma nos testes.
 
 ## Etapas
 

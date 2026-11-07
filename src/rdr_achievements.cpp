@@ -2,10 +2,16 @@
 // O perfil guarda em +0x29C o nome da ultima fase concluida (save e RAM em *0x742120 usam o mesmo layout). A coluna +0x34
 // da tabela de fases (0x7436B8) marca 20 fases, na mesma ordem das conquistas. O registro fica em
 // Documentos\Red Dead Revolver\achievements.ini (id = data) e so acumula: repetir um capitulo nao apaga nada.
+//
+// Trapacas (FUNCOES.md #110): o save tem 6 perfis de 0xB18 bytes; nome em +0x81C. A palavra em +0x860 guarda as trapacas
+// ligadas (FUN_00180C88, bits 6 a 15) e so os bits abaixo de 16 sao usados pelo jogo; o bit 31 e a marca do port, "este perfil
+// ja usou trapaca". Ela vai junto no save, entao vale por perfil, sai quando o perfil e apagado e nunca e desligada.
 #include "ps2_runtime.h"
 #include "raylib.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +38,18 @@ namespace
     const char *const kAchievementLevel[20] = {"perfnew", "hng",  "sher70", "traingood", "ghost",   "shernite", "bomb",     "cemetery", "ranch", "barfight",
                                                "bridge",  "coach", "woods",  "corenew",   "msncyn", "fort",     "trainend", "royfinal", "mans",  "mansroof"};
     constexpr uint32_t kProfilePtr = 0x00742120u, kLastLevelOffset = 0x29Cu;
+    constexpr uint32_t kProfileSize = 0xB18u, kProfileCount = 6u, kNameOffset = 0x81Cu, kCheatsOffset = 0x860u;
+    // Invincibility 6, Golden Gun 7, Show Player Position 8, Show AI Info 9, Infinite Deadeye 10, Bite the Bullet 12,
+    // Sad Stars 13, No HUD 14, No Distortion 15
+    constexpr uint32_t kCheatMask = 0xF7C0u, kCheatUsed = 0x80000000u;
+
+    std::atomic<bool> g_bigMoneyUsed{false}, g_recheckProfile{false};
+    std::atomic<int64_t> g_toastUntilMs{0};
+
+    int64_t nowMs()
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     int storyIndex(const std::string &level)
     {
@@ -110,23 +128,84 @@ namespace
 void rdrAchievementsSyncFromSave()
 {
     std::ifstream in(dataDir() / "BASLUS-20500RDR" / "BASLUS-20500RDR", std::ios::binary);
-    char name[24] = {};
-    in.seekg(kLastLevelOffset);
-    in.read(name, sizeof(name) - 1);
-    if (in)
-        mergeLevel(name);
+    for (uint32_t slot = 0u; slot < kProfileCount; ++slot)
+    {
+        const std::streamoff start = static_cast<std::streamoff>(slot) * kProfileSize;
+        uint32_t cheats = 0u;
+        char name[24] = {};
+        in.clear();
+        in.seekg(start + kCheatsOffset);
+        in.read(reinterpret_cast<char *>(&cheats), sizeof(cheats));
+        in.seekg(start + kLastLevelOffset);
+        in.read(name, sizeof(name) - 1);
+        if (in && (cheats & (kCheatMask | kCheatUsed)) == 0u)
+            mergeLevel(name);
+    }
+}
+
+// Botao Big Money da tela de trapacas (rdr_overrides.cpp): nao passa pelos bits
+void rdrAchievementsBigMoneyUsed()
+{
+    g_bigMoneyUsed.store(true, std::memory_order_relaxed);
+}
+
+// Volta do livro (onde se troca de perfil) ao escritorio: o aviso vale de novo
+void rdrAchievementsRecheckProfile()
+{
+    g_recheckProfile.store(true, std::memory_order_relaxed);
+}
+
+// Thread da janela: aviso de 6 s no canto superior, por cima do jogo
+void rdrAchievementsOverlay()
+{
+    if (nowMs() >= g_toastUntilMs.load(std::memory_order_relaxed))
+        return;
+    const float s = GetScreenHeight() / 1080.0f;
+    const char *title = "Achievements disabled";
+    const char *line = "This profile has used cheats.";
+    const int titleSize = static_cast<int>(34 * s), lineSize = static_cast<int>(24 * s);
+    const int width = std::max(MeasureText(title, titleSize), MeasureText(line, lineSize)) + static_cast<int>(48 * s);
+    const int height = static_cast<int>(92 * s);
+    const int x = (GetScreenWidth() - width) / 2, y = static_cast<int>(36 * s);
+    DrawRectangle(x, y, width, height, {12, 8, 6, 225});
+    DrawRectangleLines(x, y, width, height, {214, 170, 96, 255});
+    DrawText(title, x + static_cast<int>(24 * s), y + static_cast<int>(14 * s), titleSize, {214, 170, 96, 255});
+    DrawText(line, x + static_cast<int>(24 * s), y + static_cast<int>(54 * s), lineSize, {232, 232, 228, 255});
 }
 
 // Jogo, a cada quadro: confere o perfil na RAM a cada ~10 s
 void rdrAchievementsPump(uint8_t *rdram)
 {
+    uint32_t base = 0u;
+    std::memcpy(&base, rdram + kProfilePtr, 4);
+    if (base == 0u)
+        return;
+    uint8_t *cheatWord = rdram + ((base + kCheatsOffset) & 0x1FFFFFFu);
+    uint32_t cheats = 0u;
+    std::memcpy(&cheats, cheatWord, 4);
+    if ((cheats & kCheatMask) != 0u || g_bigMoneyUsed.exchange(false, std::memory_order_relaxed))
+    {
+        cheats |= kCheatUsed;
+        std::memcpy(cheatWord, &cheats, 4);
+    }
+    char profile[16] = {};
+    std::memcpy(profile, rdram + ((base + kNameOffset) & 0x1FFFFFFu), sizeof(profile) - 1u);
+    static std::string s_warned;
+    static uint32_t s_warnedBase = 0u;
+    if (g_recheckProfile.exchange(false, std::memory_order_relaxed))
+        s_warnedBase = 0u;
+    if ((cheats & kCheatUsed) != 0u && (s_warnedBase != base || s_warned != profile))
+    {
+        s_warned = profile;
+        s_warnedBase = base;
+        g_toastUntilMs.store(nowMs() + 6000, std::memory_order_relaxed);
+        std::fprintf(stderr, "[rdr] conquistas desativadas no perfil %s\n", profile);
+    }
     static int s_tick = 0;
     if (++s_tick < 600)
         return;
     s_tick = 0;
-    uint32_t base = 0u;
-    std::memcpy(&base, rdram + kProfilePtr, 4);
-    if (base == 0u)
+    if ((cheats & kCheatUsed) != 0u)
         return;
     char name[24] = {};
     std::memcpy(name, rdram + ((base + kLastLevelOffset) & 0x1FFFFFFu), sizeof(name) - 1u);

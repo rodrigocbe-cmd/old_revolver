@@ -1,4 +1,4 @@
-// Lancador da versao de distribuicao (v0.1.0): tela no estilo do Red Dead Revolver onde o jogador escolhe a
+// Lancador da versao de distribuicao (v1.0.0): tela no estilo do Red Dead Revolver onde o jogador escolhe a
 // propria ISO (SLUS-20500). Na 1a vez instala os arquivos em pastas por tipo (rdr_install.cpp, docs/LAYOUT.md);
 // depois "Play" inicia o jogo em tela cheia na resolucao nativa com a maior qualidade. Aberto com o ELF em argv
 // (scripts de desenvolvimento), o lancador nao aparece.
@@ -43,7 +43,7 @@ void rdrSteamWaitForExit();
 
 namespace
 {
-    constexpr const char *kVersion = "v0.1.0";
+    constexpr const char *kVersion = "v1.0.0";
     const Color kInk{235, 220, 190, 255};     // osso
     const Color kRed{150, 22, 10, 255};        // vermelho do titulo
     const Color kDim{150, 130, 105, 255};

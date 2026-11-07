@@ -162,6 +162,19 @@ fs::path rdrControlsFile()
 }
 
 // Passa as teclas atuais para o runtime
+// Menu inicial (FUNCOES.md #109): teclas proprias, nao passam pelo controls.ini. Fora de triangulo, circulo e xis, valem as do jogo.
+int rdrControlsPrimaryForPadBit(int bit);
+
+int rdrControlsMenuKeyForPadBit(int bit)
+{
+    return bit == kTriangle ? KEY_Z : bit == kCircle ? KEY_BACKSPACE : bit == kCross ? KEY_ENTER : rdrControlsPrimaryForPadBit(bit);
+}
+
+void rdrControlsSetMenuKeysActive(bool active)
+{
+    ps2PadSetMenuKeys(active, KEY_Z, KEY_BACKSPACE, KEY_ENTER);
+}
+
 void rdrControlsApply()
 {
     Ps2PadKeyMap map;

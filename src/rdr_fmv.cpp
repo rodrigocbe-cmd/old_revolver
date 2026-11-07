@@ -91,8 +91,9 @@ namespace
             const double pts = (decoded->best_effort_timestamp == AV_NOPTS_VALUE ? 0.0 : decoded->best_effort_timestamp *
                                                                                         av_q2d(format->streams[videoIndex]->time_base));
             scaler = sws_getCachedContext(scaler, decoded->width, decoded->height, static_cast<AVPixelFormat>(decoded->format),
-                                          decoded->width, decoded->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-            rgba.resize(static_cast<size_t>(decoded->width) * decoded->height * 4u);
+                                          decoded->width, decoded->height, AV_PIX_FMT_RGBA, SWS_BILINEAR | SWS_ACCURATE_RND, nullptr, nullptr, nullptr);
+            // Folga no fim: a conversao com SIMD escreve blocos inteiros e passava do ultimo pixel (heap corrompido com 600x336)
+            rgba.resize(static_cast<size_t>(decoded->width) * decoded->height * 4u + 256u);
             uint8_t *dst[4] = {rgba.data(), nullptr, nullptr, nullptr};
             int dstLine[4] = {decoded->width * 4, 0, 0, 0};
             sws_scale(scaler, decoded->data, decoded->linesize, 0, decoded->height, dst, dstLine);

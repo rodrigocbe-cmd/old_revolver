@@ -1,7 +1,7 @@
 ﻿# Monta a versao de distribuicao em dist\RedDeadRevolver-v<versao>\ (+ .zip). Nada do jogo vai junto: na 1a
 # execucao o lancador pede a ISO do jogador e instala os arquivos nas pastas (docs/LAYOUT.md).
-# Uso: .\tools\make_dist.ps1 [-Version 0.1.0]
-param([string]$Version = "0.1.0")
+# Uso: .\tools\make_dist.ps1 [-Version 1.0.0]
+param([string]$Version = "1.0.0")
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $build = Join-Path $root 'out\build\ps2xRuntime'

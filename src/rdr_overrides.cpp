@@ -28,6 +28,9 @@
 #include <vector>
 
 bool rdrDrawQuitDialog(const float game[4], int selected, float items[2][4]); // rdr_quit_dialog.cpp
+void rdrControlsSetMenuKeysActive(bool active);                                  // rdr_controls.cpp
+void rdrAchievementsBigMoneyUsed();                                               // rdr_achievements.cpp
+void rdrAchievementsRecheckProfile();                                             // rdr_achievements.cpp
 void rdrControlsLoad();                                                         // rdr_controls.cpp
 void rdrKeyIconsInstall(PS2Runtime &runtime);                                  // rdr_keyicons.cpp
 void rdrFmvInstall(PS2Runtime &runtime);                                         // rdr_fmv.cpp
@@ -698,6 +701,8 @@ namespace
     // antes da carga; usado por tools/level_audio_test.ps1 (Novo jogo -> fase escolhida no lugar do tutorial).
     PS2Runtime::RecompiledFunction g_origLevelLoad = nullptr;
 
+    bool g_inFront = true; // ultima carga foi o menu inicial ("front"), ou o jogo ainda nao carregou fase
+
     void levelLoadWithRedirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t rec = GPR_U32(ctx, 4) ? GPR_U32(ctx, 4) : 0x0079DEA0u;
@@ -717,6 +722,7 @@ namespace
         {
             std::fprintf(stderr, "[rdr] fase %s\n", lower.c_str());
         }
+        g_inFront = lower == "front";
         g_origLevelLoad(rdram, ctx, runtime);
     }
 
@@ -938,11 +944,23 @@ namespace
     PS2Runtime::RecompiledFunction g_origPromptMode = nullptr;
     bool g_inFrontendButtons = false;
 
+    bool g_leftOffice = false; // livro aberto (historia e perfis) desde a ultima vez no escritorio
+
     void swuiLoadTracked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const char *name = reinterpret_cast<const char *>(rdram + (GPR_U32(ctx, 5) & 0x1FFFFFFu));
         g_inFrontendButtons = std::strncmp(name, "frontendbuttons", 16) == 0;
         g_origSwuiLoad(rdram, ctx, runtime);
+    }
+
+    // FUN_00122CE8: callbacks da tela de trapacas; o nome esta em +0x29 do argumento
+    PS2Runtime::RecompiledFunction g_origCheatCallback = nullptr;
+
+    void cheatCallbackTracked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (std::strncmp(reinterpret_cast<const char *>(rdram + ((GPR_U32(ctx, 4) + 0x29u) & 0x1FFFFFFu)), "bigmoney", 9) == 0)
+            rdrAchievementsBigMoneyUsed();
+        g_origCheatCallback(rdram, ctx, runtime);
     }
 
     std::string roomPromptLine(const std::string &line)
@@ -1032,6 +1050,12 @@ namespace
         ps2SetBackExitEnabled(mode == "book" || mode == "poster" || mode == "journal");
         rdrSettingsSetMainMenu(mode == "book" || mode == "poster" || mode == "journal");
         g_officeMenu = mode == "book" || mode == "poster" || mode == "journal";
+        g_leftOffice = g_leftOffice || mode == "storysel";
+        if (g_officeMenu && g_leftOffice)
+        {
+            g_leftOffice = false;
+            rdrAchievementsRecheckProfile();
+        }
         g_origPromptMode(rdram, ctx, runtime);
     }
 
@@ -1076,6 +1100,8 @@ namespace
         runtime.replaceFunction(0x00105290u, swuiLoadTracked);
         g_origSwuiLine = runtime.lookupFunction(0x001054C8u);
         runtime.replaceFunction(0x001054C8u, swuiLineRewrite);
+        g_origCheatCallback = runtime.lookupFunction(0x00122CE8u);
+        runtime.replaceFunction(0x00122CE8u, cheatCallbackTracked);
         g_origPromptMode = runtime.lookupFunction(0x00123AE0u);
         runtime.replaceFunction(0x00123AE0u, promptModeTracked);
         ps2SetQuitDialogDrawer(rdrDrawQuitDialog);
@@ -1190,6 +1216,11 @@ void rdrMenuButtonsPump()
             std::fprintf(stderr, "[rdr] botoes de menu: %d\n", active ? 1 : 0);
     }
     ps2PadSetSwapTriangleCircle(active);
+    static const bool legacyKeys = [] {
+        const char *mode = std::getenv("RDR_CONTROLS");
+        return mode && _stricmp(mode, "legacy") == 0;
+    }();
+    rdrControlsSetMenuKeysActive(active && g_inFront && !legacyKeys);
 }
 
 // Inicio de quadro (rdr_settings.cpp)

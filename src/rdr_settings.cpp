@@ -36,6 +36,7 @@ float rdrUiTextWidth(int font, const std::string &text, float scale);           
 void rdrUiDrawText(int font, const std::string &text, float x, float baseline, float scale, Color color);
 std::string rdrKeyShortLabel(int code);                                           // rdr_keyicons.cpp
 int rdrControlsPrimaryForPadBit(int bit);                                         // rdr_controls.cpp
+int rdrControlsMenuKeyForPadBit(int bit);                                         // rdr_controls.cpp
 float rdrControlsWalkTilt();                                                      // rdr_controls.cpp
 void rdrControlsSetWalkTilt(float t);                                             // rdr_controls.cpp
 void rdrControlsApply();                                                          // rdr_controls.cpp
@@ -43,6 +44,9 @@ void rdrWin32ApplyWindowMode(void *window, bool fullscreen, int width, int heigh
 void rdrMenuButtonsPump();                                                        // rdr_overrides.cpp
 void rdrAchievementsPump(uint8_t *rdram);                                          // rdr_achievements.cpp
 void rdrFmvOverlay();                                                             // rdr_fmv.cpp
+bool rdrTextHasPortuguese();                                                      // rdr_text.cpp
+void rdrTextSetLanguage(int choice);                                              // rdr_text.cpp
+void rdrAchievementsOverlay();                                                    // rdr_achievements.cpp
 void rdrTitleLogoPump(uint8_t *rdram);                                            // rdr_overrides.cpp
 bool rdrControlsSave();                                                           // rdr_controls.cpp
 
@@ -64,6 +68,7 @@ namespace
         int mouseSens = 6;   // 1..20 (unidades do analogico por pixel)
         int invertY = 0;
         int walkSpeed = 9;   // 0..9 -> walk_tilt 0,40..0,76 (docs/CONTROLES.md)
+        int language = 0;    // 0 automatico (sistema), 1 ingles, 2 portugues
         // Opcoes do jogo (nao vao ao settings.ini: o jogo as salva no perfil; lidas ao abrir o menu)
         int brightness = 10; // 0..20: fracao do slider original
         int posX = 25;       // 0..50
@@ -103,7 +108,7 @@ namespace
         {"hd_textures", &StSettings::hdTextures, 0, 1}, {"hires_output", &StSettings::hiresOutput, 0, 1},
         {"image_filter", &StSettings::filter, 0, 1},    {"master_volume", &StSettings::volume, 0, 10},
         {"mouse_sensitivity", &StSettings::mouseSens, 1, 20}, {"invert_mouse_y", &StSettings::invertY, 0, 1},
-        {"walk_speed", &StSettings::walkSpeed, 0, 9}};
+        {"walk_speed", &StSettings::walkSpeed, 0, 9},   {"language", &StSettings::language, 0, 2}};
 
     void stLoad()
     {
@@ -378,7 +383,12 @@ namespace
                           {"Toggle Run / Aim", "Press once instead of holding.", {}, nullptr, 0, false, true}}});
         pages.push_back({"Interface Options",
                          {{"Subtitles", "Shows the dialogue as text.", offOn, &StSettings::subtitles},
-                          {"HUD Size", "Makes the game menus and HUD smaller on large screens.", {}, nullptr, 0, false, true}}});
+                          {"HUD Size", "Makes the game menus and HUD smaller on large screens.", {}, nullptr, 0, false, true},
+                          {"Language", "Language of the game text. Auto follows Windows, or English if there is no translation. Open menus change when reopened.",
+                           rdrTextHasPortuguese() ? std::vector<std::string>{"Auto", "English", "Portuguese"}
+                                                  : std::vector<std::string>{"Auto", "English"},
+                           &StSettings::language}}});
+        pages[4].items[2].onChange = [] { rdrTextSetLanguage(g_st.language); };
         pages[3].items[2].onChange = [] {
             rdrControlsSetWalkTilt(stWalkTilt(g_st.walkSpeed));
             rdrControlsApply();
@@ -440,7 +450,7 @@ namespace
 
     bool stMappedPressed(int padBit)
     {
-        const int code = rdrControlsPrimaryForPadBit(padBit);
+        const int code = rdrControlsMenuKeyForPadBit(padBit);
         return code > 0 && IsKeyPressed(code);
     }
 
@@ -521,8 +531,8 @@ namespace
     void stDraw(const StView &v, const std::vector<StPage> &pages)
     {
         DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), BLACK);
-        const std::string accept = rdrKeyShortLabel(rdrControlsPrimaryForPadBit(14));
-        const std::string back = rdrKeyShortLabel(rdrControlsPrimaryForPadBit(13));
+        const std::string accept = rdrKeyShortLabel(rdrControlsMenuKeyForPadBit(14));
+        const std::string back = rdrKeyShortLabel(rdrControlsMenuKeyForPadBit(13));
         if (g_menu.page < 0)
         {
             stText(0, "PC Settings", v.X(0.5f), v.Y(0.20f), v.h * 0.07f, kStRed, true);
@@ -692,6 +702,9 @@ void rdrSettingsApplyAtBoot()
 void rdrSettingsInstall(PS2Runtime &runtime)
 {
     stLoad();
+    if (g_st.language == 2 && !rdrTextHasPortuguese())
+        g_st.language = 0;
+    rdrTextSetLanguage(g_st.language);
     g_origFramePump = runtime.lookupFunction(0x0025F960u);
     runtime.replaceFunction(0x0025F960u, stFramePump);
     g_st.walkSpeed = std::clamp(static_cast<int>((rdrControlsWalkTilt() - 0.40f) / 0.04f + 0.5f), 0, 9);
@@ -703,6 +716,7 @@ void rdrSettingsInstall(PS2Runtime &runtime)
             stApplyLive(); // primeiro quadro: a janela ja existe
         }
         rdrFmvOverlay();
+        rdrAchievementsOverlay();
         return stOverlay(game);
     });
 }
